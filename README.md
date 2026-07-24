@@ -21,38 +21,34 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --exact `
   --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-Open **Developer PowerShell for VS 2022**, then build and run the display
-probe:
+Open **Developer PowerShell for VS 2022**, then build and run Monitorctl:
 
 ```powershell
 cargo run
 ```
 
-The probe is read-only. It prints active Windows display paths, friendly
-monitor names, target identifiers, and device paths.
+`list` is read-only. It prints Windows-visible monitors, friendly names,
+aliases, active state, and device paths.
 
-## Phase 1 probe
+## CLI
+
+Run `monitorctl --help` for command reference, or `monitorctl profile --help`
+for profile management. Typical profile workflow:
 
 ```powershell
 cargo run -- list
-cargo run -- list --all
-cargo run -- disable 0
-cargo run -- disable 0 --apply
-cargo run -- enable 1
-cargo run -- enable 1 --apply
-cargo run -- restore
-cargo run -- restore --apply
+cargo run -- profile save work
+cargo run -- profile create focus --active desk,laptop
+cargo run -- profile apply work
 ```
 
-`disable 0` validates only. `--apply` changes the selected active-display
-index. `enable 1` uses index from `list --all`. The probe refuses to disable
-the final active display. Run topology commands from local interactive Windows
-desktop; remote or non-desktop sessions cannot call `SetDisplayConfig`.
+`profile save` and `profile create` replace any same-named profile. Use
+`profile show <name>` to inspect one before applying or deleting it.
 
-`list --all` asks Windows for all available display paths, including inactive
-ones, then shows each Windows-visible monitor once. `restore --apply` asks
-Windows to apply its saved extended-display topology and is recovery path
-after a disable.
+All display-changing commands apply immediately. Each command is explicit;
+Monitorctl has no background state repair. It refuses to disable final active
+display. Run topology commands from local interactive Windows desktop; remote
+or non-desktop sessions cannot call `SetDisplayConfig`.
 
 ## Monitor selection
 
@@ -72,7 +68,7 @@ Monitorctl stores aliases, profiles, hotkeys, and the previous active set in:
 %LOCALAPPDATA%\monitorctl\monitorctl.toml
 ```
 
-Create the file to map aliases to paths printed by `list --all`:
+Create file to map aliases to paths printed by `list`:
 
 ```toml
 [displays]
@@ -86,12 +82,7 @@ work = ["\\\\?\\MONITOR#..."]
 ```
 
 Profiles store exact Windows device paths, never display indexes or layout.
-Profile management commands arrive in Phase 3. Current probe accepts aliases
-for `enable` and `disable`; these commands still validate unless `--apply` is
-provided.
-
 ## Status
 
-Phase 2 core provides display discovery, aliases, enable/disable/toggle,
-profile application, and previous-active-set restore. Phase 3 will expose these
-through the `monitorctl` CLI. See [roadmap](docs/roadmap.md).
+Phase 3 CLI provides display discovery, aliases, enable/disable/toggle,
+profiles, and previous-active-set restore. See [roadmap](docs/roadmap.md).

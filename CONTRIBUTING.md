@@ -16,8 +16,8 @@ cargo check
 cargo run
 ```
 
-`cargo run` is currently read-only. Keep every display-changing experiment
-explicitly opt-in and manually test it on real Windows hardware.
+`cargo run -- list` is read-only. Keep every display-changing command
+explicit and manually test it on real Windows hardware.
 
 ## Scope
 

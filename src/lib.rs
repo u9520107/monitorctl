@@ -8,39 +8,158 @@ use serde::{Deserialize, Serialize};
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_TARGET_DEVICE_NAME,
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS,
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ALL_PATHS,
     QUERY_DISPLAY_CONFIG_FLAGS, QueryDisplayConfig, SDC_ALLOW_PATH_ORDER_CHANGES, SDC_APPLY,
-    SDC_TOPOLOGY_EXTEND, SDC_TOPOLOGY_SUPPLIED, SDC_VALIDATE, SET_DISPLAY_CONFIG_FLAGS,
-    SetDisplayConfig,
+    SDC_TOPOLOGY_SUPPLIED, SDC_VALIDATE, SET_DISPLAY_CONFIG_FLAGS, SetDisplayConfig,
 };
-use windows::Win32::Foundation::LUID;
 
-pub fn run_probe() -> Result<(), String> {
+pub fn run_cli() -> Result<(), String> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
-    let config = active_display_config()?;
 
     match arguments.as_slice() {
-        [] => list_active_displays(&config),
-        [command] if command == "list" => list_active_displays(&config),
-        [command, all] if command == "list" && all == "--all" => {
-            list_all_displays(&display_config(QDC_ALL_PATHS)?)
+        [command] if matches!(command.as_str(), "--help" | "-h" | "help") => print_help(help()),
+        [command, topic] if command == "help" && topic == "profile" => print_help(profile_help()),
+        [topic, command]
+            if topic == "profile" && matches!(command.as_str(), "--help" | "-h" | "help") =>
+        {
+            print_help(profile_help())
         }
-        [command, selector] if command == "disable" => disable(&config, selector, false),
-        [command, selector, apply] if command == "disable" && apply == "--apply" => {
-            disable(&config, selector, true)
+        [] => list(),
+        [command] if command == "list" => list(),
+        [command, selector] if command == "enable" => enable_display(selector),
+        [command, selector] if command == "disable" => disable_display(selector),
+        [command, selector] if command == "toggle" => toggle_display(selector),
+        [command] if command == "restore" => restore_previous_active_set(),
+        [command, action, name] if command == "profile" && action == "save" => save_profile(name),
+        [command, action, name, active, selectors]
+            if command == "profile" && action == "create" && active == "--active" =>
+        {
+            create_profile(name, &profile_selectors(selectors))
         }
-        [command, selector] if command == "enable" => enable(&config, selector, false),
-        [command, selector, apply] if command == "enable" && apply == "--apply" => {
-            enable(&config, selector, true)
+        [command, action] if command == "profile" && action == "list" => list_profiles(),
+        [command, action, name] if command == "profile" && action == "show" => show_profile(name),
+        [command, action, name] if command == "profile" && action == "apply" => apply_profile(name),
+        [command, action, name] if command == "profile" && action == "delete" => {
+            delete_profile(name)
         }
-        [command] if command == "restore" => restore(false),
-        [command, apply] if command == "restore" && apply == "--apply" => restore(true),
         _ => Err(usage()),
     }
 }
 
-fn active_display_config() -> Result<DisplayConfig, String> {
-    display_config(QDC_ONLY_ACTIVE_PATHS)
+fn print_help(value: &str) -> Result<(), String> {
+    print!("{value}");
+    Ok(())
+}
+
+fn help() -> &'static str {
+    "\
+Monitorctl controls which Windows-visible displays are active.\n\
+Windows Display Settings owns layout, resolution, scaling, refresh rate,\n\
+orientation, primary display, and extend/duplicate mode.\n\
+\n\
+Usage: monitorctl <command>\n\
+\n\
+Commands:\n\
+  list                         List displays, aliases, paths, and active state\n\
+  enable <display>             Include one display in desktop\n\
+  disable <display>            Remove one display; refuses last active display\n\
+  toggle <display>             Enable inactive display or disable active display\n\
+  restore                      Restore active set before last successful change\n\
+  profile <command>            Manage named active-display sets\n\
+  help, --help, -h             Show this help\n\
+\n\
+Display selectors: exact alias, exact friendly name, then unique\n\
+case-insensitive friendly-name substring. Ambiguous selectors fail.\n\
+Aliases are configured in %LOCALAPPDATA%\\monitorctl\\monitorctl.toml.\n\
+\n\
+Profile workflow:\n\
+  monitorctl profile save work\n\
+  monitorctl profile create focus --active desk,laptop\n\
+  monitorctl profile apply work\n\
+  monitorctl profile show work\n\
+\n\
+Run `monitorctl profile --help` for profile commands.\n"
+}
+
+fn profile_help() -> &'static str {
+    "\
+Usage: monitorctl profile <command>\n\
+\n\
+Commands:\n\
+  save <name>                         Save current active-display set\n\
+  create <name> --active <a,b,...>    Create or replace profile from selectors\n\
+  list                                List profile names\n\
+  show <name>                         Show profile displays\n\
+  apply <name>                        Apply profile as complete active set\n\
+  delete <name>                       Delete profile\n\
+\n\
+`save` and `create` replace same-named profiles. `apply` fails without\n\
+changing Windows state if any required display is unavailable. Profiles store\n\
+only active-display paths; change layout in Windows Display Settings.\n"
+}
+
+fn list() -> Result<(), String> {
+    let config = load_config()?;
+    for display in discover_displays()? {
+        let aliases = config
+            .displays
+            .iter()
+            .filter_map(|(alias, path)| (path == &display.device_path).then_some(alias.as_str()))
+            .collect::<Vec<_>>();
+        println!(
+            "{}\n  active: {}\n  alias: {}\n  path: {}",
+            display_name(&display),
+            display.active,
+            if aliases.is_empty() {
+                "-".into()
+            } else {
+                aliases.join(", ")
+            },
+            display.device_path,
+        );
+    }
+    Ok(())
+}
+
+fn display_name(display: &Display) -> &str {
+    if display.friendly_name.is_empty() {
+        "(unnamed monitor)"
+    } else {
+        &display.friendly_name
+    }
+}
+
+fn profile_selectors(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn list_profiles() -> Result<(), String> {
+    for name in load_config()?.profiles.keys() {
+        println!("{name}");
+    }
+    Ok(())
+}
+
+fn show_profile(name: &str) -> Result<(), String> {
+    let config = load_config()?;
+    let paths = config
+        .profiles
+        .get(name)
+        .ok_or_else(|| format!("profile {name:?} does not exist"))?;
+    println!("{name}");
+    for path in paths {
+        let alias = config
+            .displays
+            .iter()
+            .find_map(|(alias, value)| (value == path).then_some(alias));
+        println!("  {}", alias.map_or(path.as_str(), String::as_str));
+    }
+    Ok(())
 }
 
 fn display_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, String> {
@@ -73,118 +192,6 @@ fn display_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, St
     Ok(DisplayConfig { paths })
 }
 
-fn list_active_displays(config: &DisplayConfig) -> Result<(), String> {
-    list_display_paths(config, "ACTIVE DISPLAY PATHS")
-}
-
-fn list_display_paths(config: &DisplayConfig, heading: &str) -> Result<(), String> {
-    println!("{heading}");
-
-    for (index, path) in config.paths.iter().enumerate() {
-        let target = target_name(path)?;
-        let friendly_name = utf16_string(&target.monitorFriendlyDeviceName);
-        let device_path = utf16_string(&target.monitorDevicePath);
-
-        println!(
-            "{index}: {}\n  active: {}\n  target: adapter {} id {}\n  path: {}",
-            if friendly_name.is_empty() {
-                "(unnamed monitor)"
-            } else {
-                &friendly_name
-            },
-            path.flags & 1 != 0,
-            luid(path.targetInfo.adapterId),
-            path.targetInfo.id,
-            device_path,
-        );
-    }
-
-    Ok(())
-}
-
-fn list_all_displays(config: &DisplayConfig) -> Result<(), String> {
-    println!("ALL WINDOWS-VISIBLE MONITORS");
-    for (index, path) in visible_monitor_paths(config)?.iter().enumerate() {
-        let target = target_name(path)?;
-        let device_path = utf16_string(&target.monitorDevicePath);
-        let friendly_name = utf16_string(&target.monitorFriendlyDeviceName);
-        println!(
-            "{index}: {}\n  active: {}\n  target: adapter {} id {}\n  path: {}",
-            if friendly_name.is_empty() {
-                "(unnamed monitor)"
-            } else {
-                &friendly_name
-            },
-            path.flags & 1 != 0,
-            luid(path.targetInfo.adapterId),
-            path.targetInfo.id,
-            device_path,
-        );
-    }
-
-    Ok(())
-}
-
-fn disable(config: &DisplayConfig, selector: &str, apply: bool) -> Result<(), String> {
-    let display = select_display(selector)?;
-    let index = config
-        .paths
-        .iter()
-        .position(|path| {
-            display_from_path(path).is_ok_and(|current| current.device_path == display.device_path)
-        })
-        .ok_or_else(|| format!("display {selector:?} is not active"))?;
-
-    let mut paths = without_display(&config.paths, index)?;
-    clear_mode_indices(&mut paths);
-    let flags = SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES;
-
-    set_display_config(&paths, SDC_VALIDATE | flags, "validation")?;
-    if !apply {
-        println!(
-            "validated disable of display {selector}; rerun with --apply to change Windows topology"
-        );
-        return Ok(());
-    }
-
-    set_display_config(&paths, SDC_APPLY | flags, "apply")?;
-    println!("disabled display {selector}");
-    Ok(())
-}
-
-fn enable(config: &DisplayConfig, selector: &str, apply: bool) -> Result<(), String> {
-    let display = select_display(selector)?;
-    let target = *visible_monitor_paths(&display_config(QDC_ALL_PATHS)?)?
-        .iter()
-        .find(|path| {
-            display_from_path(path).is_ok_and(|current| current.device_path == display.device_path)
-        })
-        .ok_or_else(|| format!("display {selector:?} is not available"))?;
-
-    if config.paths.iter().any(|path| same_target(path, &target)) {
-        return Err(format!("display {selector:?} is already active"));
-    }
-
-    let mut paths = config.paths.clone();
-    let mut target = target;
-    target.flags |= 1;
-    paths.push(target);
-    clear_mode_indices(&mut paths);
-
-    let flags = SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES;
-    set_display_config(&paths, SDC_VALIDATE | flags, "validation")?;
-    if !apply {
-        println!(
-            "validated enable of display {selector}; rerun with --apply to change Windows topology"
-        );
-        return Ok(());
-    }
-
-    set_display_config(&paths, SDC_APPLY | flags, "apply")?;
-    println!("enabled display {selector}");
-    Ok(())
-}
-
 fn visible_monitor_paths(config: &DisplayConfig) -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, String> {
     let mut device_paths = BTreeSet::new();
     let mut monitors = Vec::new();
@@ -200,11 +207,6 @@ fn visible_monitor_paths(config: &DisplayConfig) -> Result<Vec<DISPLAYCONFIG_PAT
     Ok(monitors)
 }
 
-fn same_target(left: &DISPLAYCONFIG_PATH_INFO, right: &DISPLAYCONFIG_PATH_INFO) -> bool {
-    left.targetInfo.adapterId == right.targetInfo.adapterId
-        && left.targetInfo.id == right.targetInfo.id
-}
-
 fn clear_mode_indices(paths: &mut [DISPLAYCONFIG_PATH_INFO]) {
     for path in paths {
         path.sourceInfo.Anonymous.modeInfoIdx = u32::MAX;
@@ -218,34 +220,6 @@ fn set_display_config(
     operation: &str,
 ) -> Result<(), String> {
     let result = unsafe { SetDisplayConfig(Some(paths), None, flags) };
-    if result == 0 {
-        Ok(())
-    } else if result == 5 {
-        Err(format!(
-            "SetDisplayConfig {operation} failed: access denied; run from the local interactive Windows desktop"
-        ))
-    } else {
-        Err(format!("SetDisplayConfig {operation} failed: {result}"))
-    }
-}
-
-fn restore(apply: bool) -> Result<(), String> {
-    let flags = SDC_TOPOLOGY_EXTEND;
-    set_topology(SDC_VALIDATE | flags, "restore validation")?;
-    if !apply {
-        println!(
-            "validated Windows extended-topology restore; rerun with --apply to change Windows topology"
-        );
-        return Ok(());
-    }
-
-    set_topology(SDC_APPLY | flags, "restore apply")?;
-    println!("restored Windows extended topology");
-    Ok(())
-}
-
-fn set_topology(flags: SET_DISPLAY_CONFIG_FLAGS, operation: &str) -> Result<(), String> {
-    let result = unsafe { SetDisplayConfig(None, None, flags) };
     if result == 0 {
         Ok(())
     } else if result == 5 {
@@ -280,12 +254,8 @@ fn utf16_string(value: &[u16]) -> String {
     String::from_utf16_lossy(value.split(|unit| *unit == 0).next().unwrap_or_default())
 }
 
-fn luid(value: LUID) -> String {
-    format!("{:08x}:{:08x}", value.HighPart as u32, value.LowPart)
-}
-
 fn usage() -> String {
-    "usage: monitorctl-probe [list [--all]] | disable <display> [--apply] | enable <display> [--apply] | restore [--apply]".into()
+    "invalid command; run `monitorctl --help`".into()
 }
 
 struct DisplayConfig {
@@ -355,11 +325,6 @@ pub fn discover_displays() -> Result<Vec<Display>, String> {
         .collect()
 }
 
-fn select_display(selector: &str) -> Result<Display, String> {
-    let config = load_config()?;
-    resolve_display(&discover_displays()?, &config.displays, selector).cloned()
-}
-
 /// Resolve alias, then exact friendly name, then one case-insensitive name substring.
 pub fn resolve_display<'a>(
     displays: &'a [Display],
@@ -408,24 +373,6 @@ fn display_from_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<Display, String> 
         device_path: utf16_string(&target.monitorDevicePath),
         active: path.flags & 1 != 0,
     })
-}
-
-fn without_display(
-    paths: &[DISPLAYCONFIG_PATH_INFO],
-    index: usize,
-) -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, String> {
-    if paths.len() <= 1 {
-        return Err("refusing to disable the last active display".into());
-    }
-    if index >= paths.len() {
-        return Err(format!("display index {index} is not active"));
-    }
-
-    Ok(paths
-        .iter()
-        .enumerate()
-        .filter_map(|(current, path)| (current != index).then_some(*path))
-        .collect())
 }
 
 pub fn enable_display(selector: &str) -> Result<(), String> {
@@ -481,6 +428,22 @@ pub fn create_profile(name: &str, selectors: &[String]) -> Result<(), String> {
     config
         .profiles
         .insert(name.into(), paths.into_iter().collect());
+    save_config(&config)
+}
+
+pub fn save_profile(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("profile name cannot be empty".into());
+    }
+
+    let mut config = load_config()?;
+    let active = active_paths(&discover_displays()?);
+    if active.is_empty() {
+        return Err("no active displays to save".into());
+    }
+    config
+        .profiles
+        .insert(name.into(), active.into_iter().collect());
     save_config(&config)
 }
 
@@ -559,6 +522,10 @@ fn apply_active_set(
     if desired.is_empty() {
         return Err("refusing to disable the last active display".into());
     }
+    let previous_active = active_paths(displays);
+    if desired == &previous_active {
+        return Ok(());
+    }
     let available = displays
         .iter()
         .map(|display| display.device_path.as_str())
@@ -569,9 +536,6 @@ fn apply_active_set(
     {
         return Err(format!("display path is not available: {missing}"));
     }
-
-    config.previous_active = Some(active_paths(displays).into_iter().collect());
-    save_config(config)?;
 
     let paths = visible_monitor_paths(&display_config(QDC_ALL_PATHS)?)?
         .into_iter()
@@ -590,17 +554,25 @@ fn apply_active_set(
     clear_mode_indices(&mut paths);
     let flags = SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES;
     set_display_config(&paths, SDC_VALIDATE | flags, "validation")?;
-    set_display_config(&paths, SDC_APPLY | flags, "apply")
+
+    let old_previous_active = config.previous_active.clone();
+    config.previous_active = Some(previous_active.into_iter().collect());
+    save_config(config)?;
+    if let Err(error) = set_display_config(&paths, SDC_APPLY | flags, "apply") {
+        config.previous_active = old_previous_active;
+        return match save_config(config) {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!(
+                "{error}; also could not restore previous active-display set: {restore_error}"
+            )),
+        };
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn refuses_to_remove_last_display() {
-        assert!(without_display(&[DISPLAYCONFIG_PATH_INFO::default()], 0).is_err());
-    }
 
     fn display(name: &str, path: &str) -> Display {
         Display {
@@ -626,5 +598,27 @@ mod tests {
     fn rejects_ambiguous_partial_name() {
         let displays = [display("Dell Left", "left"), display("Dell Right", "right")];
         assert!(resolve_display(&displays, &BTreeMap::new(), "dell").is_err());
+    }
+
+    #[test]
+    fn parses_profile_selectors() {
+        assert_eq!(profile_selectors(" desk, laptop ,,"), ["desk", "laptop"]);
+    }
+
+    #[test]
+    fn ignores_active_set_no_op_without_saving_restore_state() {
+        let displays = [display("Desk", "desk")];
+        let desired = BTreeSet::from(["desk".into()]);
+        let mut config = Config::default();
+
+        apply_active_set(&mut config, &displays, &desired).unwrap();
+
+        assert_eq!(config.previous_active, None);
+    }
+
+    #[test]
+    fn help_covers_profile_workflow() {
+        assert!(help().contains("monitorctl profile save work"));
+        assert!(profile_help().contains("create <name>"));
     }
 }
