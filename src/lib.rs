@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -115,7 +116,7 @@ Usage: monitorctl profile <command>\n\
 Commands:\n\
   save <name>                         Save current active-display set\n\
   create <name> --active <a,b,...>    Create or replace profile from selectors\n\
-  list                                List profile names\n\
+  list                                List profiles and their displays\n\
   show <name>                         Show profile displays\n\
   apply <name>                        Apply profile as complete active set\n\
   delete <name>                       Delete profile\n\
@@ -205,10 +206,47 @@ fn profile_selectors(value: &str) -> Vec<String> {
 }
 
 fn list_profiles() -> Result<(), String> {
-    for name in load_config()?.profiles.keys() {
-        println!("{name}");
+    let config = load_config()?;
+    let displays = discover_displays()?;
+    let active = active_paths(&displays);
+    let present = displays
+        .iter()
+        .map(|display| display.device_path.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for (name, paths) in &config.profiles {
+        let desired = paths.iter().cloned().collect::<BTreeSet<_>>();
+        let status = if desired == active {
+            "  [active]"
+        } else if paths.iter().any(|path| !present.contains(path.as_str())) {
+            "  [unavailable]"
+        } else {
+            ""
+        };
+        println!("{name}{status}");
+        for path in paths {
+            println!("  - {}", profile_display_name(&config, &displays, path));
+        }
     }
     Ok(())
+}
+
+fn profile_display_name(config: &Config, displays: &[Display], path: &str) -> String {
+    config
+        .displays
+        .iter()
+        .find_map(|(alias, value)| (value == path).then_some(alias.clone()))
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|display| display.device_path == path)
+                .map(|display| {
+                    (!display.friendly_name.is_empty())
+                        .then_some(display.friendly_name.clone())
+                        .unwrap_or_else(|| "(unnamed monitor)".into())
+                })
+        })
+        .unwrap_or_else(|| "Unavailable display".into())
 }
 
 fn list_hotkeys() -> Result<(), String> {
@@ -306,33 +344,41 @@ fn show_profile(name: &str) -> Result<(), String> {
 }
 
 fn display_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, String> {
-    let mut path_count = 0;
-    let mut mode_count = 0;
+    for _ in 0..2 {
+        let mut path_count = 0;
+        let mut mode_count = 0;
 
-    unsafe {
-        GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count)
+        unsafe {
+            GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count)
+                .ok()
+                .map_err(|error| format!("GetDisplayConfigBufferSizes failed: {error}"))?;
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+
+        let result = unsafe {
+            QueryDisplayConfig(
+                flags,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if result == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        result
             .ok()
-            .map_err(|error| format!("GetDisplayConfigBufferSizes failed: {error}"))?;
+            .map_err(|error| format!("QueryDisplayConfig failed: {error}"))?;
+
+        paths.truncate(path_count as usize);
+        return Ok(DisplayConfig { paths });
     }
 
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-
-    unsafe {
-        QueryDisplayConfig(
-            flags,
-            &mut path_count,
-            paths.as_mut_ptr(),
-            &mut mode_count,
-            modes.as_mut_ptr(),
-            None,
-        )
-        .ok()
-        .map_err(|error| format!("QueryDisplayConfig failed: {error}"))?;
-    }
-
-    paths.truncate(path_count as usize);
-    Ok(DisplayConfig { paths })
+    Err("QueryDisplayConfig failed: insufficient buffer after retry".to_string())
 }
 
 fn visible_monitor_paths(config: &DisplayConfig) -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, String> {
@@ -865,6 +911,20 @@ mod tests {
     #[test]
     fn parses_profile_selectors() {
         assert_eq!(profile_selectors(" desk, laptop ,,"), ["desk", "laptop"]);
+    }
+
+    #[test]
+    fn labels_profile_displays_with_alias_or_friendly_name() {
+        let mut config = Config::default();
+        config.displays.insert("desk".into(), "path-1".into());
+        let displays = [display("Dell 27", "path-1"), display("LG 24", "path-2")];
+
+        assert_eq!(profile_display_name(&config, &displays, "path-1"), "desk");
+        assert_eq!(profile_display_name(&config, &displays, "path-2"), "LG 24");
+        assert_eq!(
+            profile_display_name(&config, &displays, "missing"),
+            "Unavailable display"
+        );
     }
 
     #[test]

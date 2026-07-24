@@ -1,6 +1,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::{collections::BTreeSet, mem::size_of};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem::size_of,
+    sync::{Mutex, OnceLock},
+};
 
 use monitorctl_core::{Display, discover_displays, load_config};
 use windows::{
@@ -17,9 +22,9 @@ use windows::{
                 CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
                 GetCursorPos, GetMessageW, HMENU, IMAGE_FLAGS, MENU_ITEM_FLAGS, MF_CHECKED,
                 MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
-                RegisterClassW, SetForegroundWindow, TPM_RIGHTBUTTON, TrackPopupMenu,
-                TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY,
-                WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+                RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_RIGHTBUTTON,
+                TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+                WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
@@ -33,10 +38,37 @@ const MENU_PROFILE_BASE: u32 = 2_000;
 const MENU_RESTORE: u32 = 3_000;
 const MENU_QUIT: u32 = 3_001;
 const HOTKEY_BASE: i32 = 4_000;
+const MOD_NOREPEAT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x4000);
 const TRAY_ICON: &[u8] = include_bytes!("../assets/monitorctl.ico");
+
+static TRAY_STATE: OnceLock<Mutex<TrayState>> = OnceLock::new();
+static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
+
+#[derive(Default)]
+struct TrayState {
+    hotkeys: BTreeMap<i32, String>,
+    menu_actions: BTreeMap<u32, MenuAction>,
+}
+
+#[derive(Clone)]
+enum MenuAction {
+    Toggle {
+        path: Option<String>,
+        label: String,
+        active: bool,
+    },
+    Profile(String),
+    Restore,
+}
+
+fn tray_state() -> &'static Mutex<TrayState> {
+    TRAY_STATE.get_or_init(|| Mutex::new(TrayState::default()))
+}
 
 fn main() -> WindowsResult<()> {
     unsafe {
+        let taskbar_created = wide("TaskbarCreated");
+        let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(PCWSTR(taskbar_created.as_ptr())));
         let class_name = wide(CLASS_NAME);
         let class = WNDCLASSW {
             lpszClassName: PCWSTR(class_name.as_ptr()),
@@ -80,6 +112,14 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        message
+            if TASKBAR_CREATED
+                .get()
+                .is_some_and(|taskbar| *taskbar == message) =>
+        {
+            let _ = add_icon(window);
+            LRESULT(0)
+        }
         TRAY_MESSAGE
             if matches!(
                 lparam.0 as u32,
@@ -112,6 +152,7 @@ unsafe fn show_menu(window: HWND) {
         show_osd("Cannot read monitor state", 5_000);
         return;
     };
+    let mut menu_actions = BTreeMap::new();
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
@@ -130,6 +171,14 @@ unsafe fn show_menu(window: HWND) {
             if display.active { "  On" } else { "  Off" }
         );
         append(menu, flags, MENU_MONITOR_BASE + index as u32, &label);
+        menu_actions.insert(
+            MENU_MONITOR_BASE + index as u32,
+            MenuAction::Toggle {
+                path: display.path.clone(),
+                label: display.label.clone(),
+                active: display.active,
+            },
+        );
     }
     append(menu, MF_SEPARATOR, 0, "");
     append(menu, MF_STRING | MF_DISABLED, 0, "Profiles");
@@ -145,6 +194,18 @@ unsafe fn show_menu(window: HWND) {
             MF_STRING | MF_GRAYED
         };
         append(menu, flags, MENU_PROFILE_BASE + index as u32, &profile.name);
+        for display in &profile.displays {
+            append(
+                menu,
+                MF_STRING | MF_GRAYED,
+                0,
+                &format!("    - {}", display.label),
+            );
+        }
+        menu_actions.insert(
+            MENU_PROFILE_BASE + index as u32,
+            MenuAction::Profile(profile.name.clone()),
+        );
     }
     append(menu, MF_SEPARATOR, 0, "");
     append(
@@ -157,7 +218,9 @@ unsafe fn show_menu(window: HWND) {
         MENU_RESTORE,
         "Restore",
     );
+    menu_actions.insert(MENU_RESTORE, MenuAction::Restore);
     append(menu, MF_STRING, MENU_QUIT, "Quit");
+    tray_state().lock().unwrap().menu_actions = menu_actions;
     let mut point = Default::default();
     let _ = GetCursorPos(&mut point);
     let _ = SetForegroundWindow(window);
@@ -179,49 +242,37 @@ unsafe fn append(menu: HMENU, flags: MENU_ITEM_FLAGS, id: u32, label: &str) {
 }
 
 unsafe fn run_menu_action(window: HWND, command: u32) {
-    let (result, success) = match command {
-        MENU_QUIT => {
-            let _ = DestroyWindow(window);
-            return;
-        }
-        MENU_RESTORE => (
+    if command == MENU_QUIT {
+        let _ = DestroyWindow(window);
+        return;
+    }
+    let action = tray_state()
+        .lock()
+        .unwrap()
+        .menu_actions
+        .get(&command)
+        .cloned();
+    let (result, success) = match action {
+        Some(MenuAction::Restore) => (
             monitorctl_core::restore_previous_active_set(),
             "Restored previous display set".into(),
         ),
-        command if command >= MENU_MONITOR_BASE && command < MENU_PROFILE_BASE => {
-            let item = menu_state().and_then(|state| {
-                state
-                    .displays
-                    .get((command - MENU_MONITOR_BASE) as usize)
-                    .map(|display| (display.path.clone(), display.label.clone(), display.active))
-                    .ok_or_else(|| "invalid monitor menu item".into())
-            });
-            match item {
-                Ok((Some(path), label, active)) => (
-                    monitorctl_core::toggle_display_path(&path),
-                    format!("{} {label}", if active { "Disabled" } else { "Enabled" }),
-                ),
-                Ok((None, _, _)) => (Err("display is unavailable".into()), String::new()),
-                Err(error) => (Err(error), String::new()),
-            }
-        }
-        command if command >= MENU_PROFILE_BASE && command < MENU_RESTORE => {
-            let profile = menu_state().and_then(|state| {
-                state
-                    .profiles
-                    .get((command - MENU_PROFILE_BASE) as usize)
-                    .map(|profile| profile.name.clone())
-                    .ok_or_else(|| "invalid profile menu item".into())
-            });
-            match profile {
-                Ok(name) => (
-                    monitorctl_core::apply_profile(&name),
-                    format!("Applied profile {name}"),
-                ),
-                Err(error) => (Err(error), String::new()),
-            }
-        }
-        _ => return,
+        Some(MenuAction::Toggle {
+            path,
+            label,
+            active,
+        }) => match path {
+            Some(path) => (
+                monitorctl_core::toggle_display_path(&path),
+                format!("{} {label}", if active { "Disabled" } else { "Enabled" }),
+            ),
+            None => (Err("display is unavailable".into()), String::new()),
+        },
+        Some(MenuAction::Profile(name)) => (
+            monitorctl_core::apply_profile(&name),
+            format!("Applied profile {name}"),
+        ),
+        None => return,
     };
     show_result(result, &success);
 }
@@ -230,7 +281,8 @@ unsafe fn register_hotkeys(window: HWND) {
     let Ok(config) = load_config() else {
         return;
     };
-    for (index, key) in config.hotkeys.keys().enumerate() {
+    let mut hotkeys = tray_state().lock().unwrap();
+    for (index, (key, action)) in config.hotkeys.iter().enumerate() {
         if let Some((modifiers, virtual_key)) = parse_hotkey(key) {
             if RegisterHotKey(
                 Some(window),
@@ -241,6 +293,10 @@ unsafe fn register_hotkeys(window: HWND) {
             .is_err()
             {
                 show_osd(&format!("Hotkey unavailable: {key}"), 5_000);
+            } else {
+                hotkeys
+                    .hotkeys
+                    .insert(HOTKEY_BASE + index as i32, action.clone());
             }
         } else {
             show_osd(&format!("Invalid hotkey: {key}"), 5_000);
@@ -249,26 +305,22 @@ unsafe fn register_hotkeys(window: HWND) {
 }
 
 unsafe fn unregister_hotkeys(window: HWND) {
-    let Ok(config) = load_config() else {
-        return;
+    let ids = {
+        let mut state = tray_state().lock().unwrap();
+        std::mem::take(&mut state.hotkeys)
+            .into_keys()
+            .collect::<Vec<_>>()
     };
-    for index in 0..config.hotkeys.len() {
-        let _ = UnregisterHotKey(Some(window), HOTKEY_BASE + index as i32);
+    for id in ids {
+        let _ = UnregisterHotKey(Some(window), id);
     }
 }
 
 unsafe fn run_hotkey(_window: HWND, id: i32) {
-    let action = load_config().and_then(|config| {
-        config
-            .hotkeys
-            .iter()
-            .nth((id - HOTKEY_BASE) as usize)
-            .ok_or_else(|| "unknown hotkey".into())
-            .map(|(_, action)| action.clone())
-    });
+    let action = tray_state().lock().unwrap().hotkeys.get(&id).cloned();
     let (result, success) = match action {
-        Ok(action) => (run_action(&action), action_summary(&action)),
-        Err(error) => (Err(error), String::new()),
+        Some(action) => (run_action(&action), action_summary(&action)),
+        None => (Err("unknown hotkey".into()), String::new()),
     };
     show_result(result, &success);
 }
@@ -373,7 +425,7 @@ fn parse_hotkey(value: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
             _ => return None,
         }
     }
-    key.map(|key| (modifiers, key))
+    key.map(|key| (modifiers | MOD_NOREPEAT, key))
 }
 
 struct MenuState {
@@ -391,8 +443,13 @@ struct MenuDisplay {
 
 struct MenuProfile {
     name: String,
+    displays: Vec<MenuProfileDisplay>,
     available: bool,
     active: bool,
+}
+
+struct MenuProfileDisplay {
+    label: String,
 }
 
 fn menu_state() -> std::result::Result<MenuState, String> {
@@ -431,11 +488,35 @@ fn menu_state() -> std::result::Result<MenuState, String> {
     let profiles = config
         .profiles
         .iter()
-        .map(|(name, paths)| MenuProfile {
-            name: name.clone(),
-            available: !paths.is_empty()
-                && paths.iter().all(|path| present.contains(path.as_str())),
-            active: paths.iter().cloned().collect::<BTreeSet<_>>() == active,
+        .map(|(name, paths)| {
+            let displays = paths
+                .iter()
+                .map(|path| {
+                    let label = discovered
+                        .iter()
+                        .find(|display| display.device_path == *path)
+                        .map(|display| {
+                            let alias = config.displays.iter().find_map(|(alias, value)| {
+                                (value == path).then_some(alias.as_str())
+                            });
+                            display_label(alias, &display.friendly_name)
+                        })
+                        .or_else(|| {
+                            config.displays.iter().find_map(|(alias, value)| {
+                                (value == path).then_some(format!("{alias}  Unavailable"))
+                            })
+                        })
+                        .unwrap_or_else(|| "Unavailable display".into());
+                    MenuProfileDisplay { label }
+                })
+                .collect();
+            MenuProfile {
+                name: name.clone(),
+                displays,
+                available: !paths.is_empty()
+                    && paths.iter().all(|path| present.contains(path.as_str())),
+                active: paths.iter().cloned().collect::<BTreeSet<_>>() == active,
+            }
         })
         .collect();
     let restore_available = config.previous_active.as_ref().is_some_and(|paths| {
@@ -483,7 +564,7 @@ mod tests {
     fn parses_configured_hotkey_format() {
         assert_eq!(
             parse_hotkey("ctrl+alt+w"),
-            Some((HOT_KEY_MODIFIERS(3), 'W' as u32))
+            Some((HOT_KEY_MODIFIERS(0x4003), 'W' as u32))
         );
     }
 
