@@ -19,8 +19,9 @@ Build a small Rust proof of concept to confirm native Windows APIs can:
 - restore Windows' remembered placement on re-enable; and
 - refuse an operation that would leave no active display.
 
-Test laptop panel, HDMI/DisplayPort, dock, duplicate mode, unplug/replug, and
-sleep/resume where available.
+Verify that each invocation re-enumerates current Windows-visible displays
+after external topology changes. Do not add monitoring, automatic repair, or
+connection-type-specific behavior.
 
 Gate: do not build user interfaces until this works reliably on target setup.
 
