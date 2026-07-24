@@ -19,6 +19,10 @@ Profiles are named sets of active displays. They do not store display layout.
   connection-type, sleep, or unplug-specific behavior.
 - Never disable the last active display.
 - Missing profile display fails safely. Do not partially apply profiles in v1.
+- Monitor selectors resolve exact alias, exact friendly name, then unique
+  case-insensitive friendly-name substring. Ambiguous selectors fail.
+- Store exact Windows monitor device path behind user aliases; never persist
+  numeric display indexes.
 
 ## Implementation
 

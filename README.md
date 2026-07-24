@@ -54,6 +54,36 @@ ones, then shows each Windows-visible monitor once. `restore --apply` asks
 Windows to apply its saved extended-display topology and is recovery path
 after a disable.
 
+## Monitor selection
+
+Numeric indexes are Phase 1 probe behavior only; Windows does not guarantee
+their order. Phase 2 commands resolve monitors in this order:
+
+1. exact user alias;
+2. exact friendly monitor name; then
+3. case-insensitive unique substring of friendly monitor name.
+
+Ambiguous partial names fail with matching monitor names. Monitorctl stores
+the exact Windows monitor device path behind each alias.
+
+Optional `monitorctl.toml` in current directory maps aliases to paths printed
+by `list --all`:
+
+```toml
+[displays]
+desk = "\\\\?\\MONITOR#..."
+
+[profiles]
+work = ["desk"]
+
+[hotkeys]
+"ctrl+alt+w" = "profile:work"
+```
+
+Profiles and hotkeys are configuration data for later Phase 2 work; current
+probe accepts aliases for `enable` and `disable`. These commands still validate
+unless `--apply` is provided.
+
 ## Status
 
 Phase 1: validating native Windows display APIs. See

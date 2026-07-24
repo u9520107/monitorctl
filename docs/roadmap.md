@@ -38,6 +38,10 @@ Create `monitorctl-core` for display discovery and state changes.
 Use one small local configuration file for display matching, aliases, profiles,
 and fixed hotkeys.
 
+Start by replacing Phase 1 numeric indexes with aliases and monitor-name
+selectors. Resolve exact alias, exact name, then unique case-insensitive
+partial name; ambiguous partial names fail.
+
 ## Phase 3: CLI
 
 Provide scriptable commands:
