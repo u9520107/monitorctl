@@ -21,7 +21,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --exact `
   --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-Open **Developer PowerShell for VS 2022**, then build and run the Phase 1
+Open **Developer PowerShell for VS 2022**, then build and run the display
 probe:
 
 ```powershell
@@ -66,25 +66,32 @@ their order. Phase 2 commands resolve monitors in this order:
 Ambiguous partial names fail with matching monitor names. Monitorctl stores
 the exact Windows monitor device path behind each alias.
 
-Optional `monitorctl.toml` in current directory maps aliases to paths printed
-by `list --all`:
+Monitorctl stores aliases, profiles, hotkeys, and the previous active set in:
+
+```text
+%LOCALAPPDATA%\monitorctl\monitorctl.toml
+```
+
+Create the file to map aliases to paths printed by `list --all`:
 
 ```toml
 [displays]
 desk = "\\\\?\\MONITOR#..."
 
 [profiles]
-work = ["desk"]
+work = ["\\\\?\\MONITOR#..."]
 
 [hotkeys]
 "ctrl+alt+w" = "profile:work"
 ```
 
-Profiles and hotkeys are configuration data for later Phase 2 work; current
-probe accepts aliases for `enable` and `disable`. These commands still validate
-unless `--apply` is provided.
+Profiles store exact Windows device paths, never display indexes or layout.
+Profile management commands arrive in Phase 3. Current probe accepts aliases
+for `enable` and `disable`; these commands still validate unless `--apply` is
+provided.
 
 ## Status
 
-Phase 1: validating native Windows display APIs. See
-[roadmap](docs/roadmap.md).
+Phase 2 core provides display discovery, aliases, enable/disable/toggle,
+profile application, and previous-active-set restore. Phase 3 will expose these
+through the `monitorctl` CLI. See [roadmap](docs/roadmap.md).

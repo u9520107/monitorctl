@@ -125,15 +125,15 @@ fn list_all_displays(config: &DisplayConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn disable(config: &DisplayConfig, index: &str, apply: bool) -> Result<(), String> {
-    let display = select_display(index)?;
+fn disable(config: &DisplayConfig, selector: &str, apply: bool) -> Result<(), String> {
+    let display = select_display(selector)?;
     let index = config
         .paths
         .iter()
         .position(|path| {
             display_from_path(path).is_ok_and(|current| current.device_path == display.device_path)
         })
-        .ok_or_else(|| format!("display {index:?} is not active"))?;
+        .ok_or_else(|| format!("display {selector:?} is not active"))?;
 
     let mut paths = without_display(&config.paths, index)?;
     clear_mode_indices(&mut paths);
@@ -142,27 +142,27 @@ fn disable(config: &DisplayConfig, index: &str, apply: bool) -> Result<(), Strin
     set_display_config(&paths, SDC_VALIDATE | flags, "validation")?;
     if !apply {
         println!(
-            "validated disable of display {index}; rerun with --apply to change Windows topology"
+            "validated disable of display {selector}; rerun with --apply to change Windows topology"
         );
         return Ok(());
     }
 
     set_display_config(&paths, SDC_APPLY | flags, "apply")?;
-    println!("disabled display {index}");
+    println!("disabled display {selector}");
     Ok(())
 }
 
-fn enable(config: &DisplayConfig, index: &str, apply: bool) -> Result<(), String> {
-    let display = select_display(index)?;
+fn enable(config: &DisplayConfig, selector: &str, apply: bool) -> Result<(), String> {
+    let display = select_display(selector)?;
     let target = *visible_monitor_paths(&display_config(QDC_ALL_PATHS)?)?
         .iter()
         .find(|path| {
             display_from_path(path).is_ok_and(|current| current.device_path == display.device_path)
         })
-        .ok_or_else(|| format!("display {index:?} is not available"))?;
+        .ok_or_else(|| format!("display {selector:?} is not available"))?;
 
     if config.paths.iter().any(|path| same_target(path, &target)) {
-        return Err(format!("display index {index} is already active"));
+        return Err(format!("display {selector:?} is already active"));
     }
 
     let mut paths = config.paths.clone();
@@ -175,13 +175,13 @@ fn enable(config: &DisplayConfig, index: &str, apply: bool) -> Result<(), String
     set_display_config(&paths, SDC_VALIDATE | flags, "validation")?;
     if !apply {
         println!(
-            "validated enable of display {index}; rerun with --apply to change Windows topology"
+            "validated enable of display {selector}; rerun with --apply to change Windows topology"
         );
         return Ok(());
     }
 
     set_display_config(&paths, SDC_APPLY | flags, "apply")?;
-    println!("enabled display {index}");
+    println!("enabled display {selector}");
     Ok(())
 }
 
@@ -301,6 +301,8 @@ pub struct Config {
     pub profiles: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub hotkeys: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_active: Option<Vec<String>>,
 }
 
 impl Config {
@@ -311,6 +313,32 @@ impl Config {
     pub fn to_toml(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|error| format!("cannot write config: {error}"))
     }
+}
+
+pub fn config_path() -> Result<std::path::PathBuf, String> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .ok_or("LOCALAPPDATA is not set; cannot locate monitorctl configuration")?;
+    Ok(std::path::PathBuf::from(local_app_data)
+        .join("monitorctl")
+        .join("monitorctl.toml"))
+}
+
+pub fn load_config() -> Result<Config, String> {
+    let path = config_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(value) => Config::from_toml(&value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
+}
+
+pub fn save_config(config: &Config) -> Result<(), String> {
+    let path = config_path()?;
+    let directory = path.parent().expect("config path has parent");
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    std::fs::write(&path, config.to_toml()?)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,11 +356,7 @@ pub fn discover_displays() -> Result<Vec<Display>, String> {
 }
 
 fn select_display(selector: &str) -> Result<Display, String> {
-    let config = match std::fs::read_to_string("monitorctl.toml") {
-        Ok(value) => Config::from_toml(&value)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(error) => return Err(format!("cannot read monitorctl.toml: {error}")),
-    };
+    let config = load_config()?;
     resolve_display(&discover_displays()?, &config.displays, selector).cloned()
 }
 
@@ -402,6 +426,171 @@ fn without_display(
         .enumerate()
         .filter_map(|(current, path)| (current != index).then_some(*path))
         .collect())
+}
+
+pub fn enable_display(selector: &str) -> Result<(), String> {
+    change_display(selector, true)
+}
+
+pub fn disable_display(selector: &str) -> Result<(), String> {
+    change_display(selector, false)
+}
+
+pub fn toggle_display(selector: &str) -> Result<(), String> {
+    let config = load_config()?;
+    let displays = discover_displays()?;
+    let display = resolve_display(&displays, &config.displays, selector)?;
+    change_display(selector, !display.active)
+}
+
+fn change_display(selector: &str, active: bool) -> Result<(), String> {
+    let mut config = load_config()?;
+    let displays = discover_displays()?;
+    let display = resolve_display(&displays, &config.displays, selector)?;
+    if display.active == active {
+        return Err(format!(
+            "display {selector:?} is already {}",
+            if active { "active" } else { "inactive" }
+        ));
+    }
+
+    let mut desired = active_paths(&displays);
+    if active {
+        desired.insert(display.device_path.clone());
+    } else {
+        desired.remove(&display.device_path);
+    }
+    apply_active_set(&mut config, &displays, &desired)
+}
+
+pub fn create_profile(name: &str, selectors: &[String]) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("profile name cannot be empty".into());
+    }
+    if selectors.is_empty() {
+        return Err("profile must include at least one display".into());
+    }
+
+    let mut config = load_config()?;
+    let displays = discover_displays()?;
+    let mut paths = BTreeSet::new();
+    for selector in selectors {
+        let display = resolve_display(&displays, &config.displays, selector)?;
+        paths.insert(display.device_path.clone());
+    }
+    config
+        .profiles
+        .insert(name.into(), paths.into_iter().collect());
+    save_config(&config)
+}
+
+pub fn delete_profile(name: &str) -> Result<(), String> {
+    let mut config = load_config()?;
+    if config.profiles.remove(name).is_none() {
+        return Err(format!("profile {name:?} does not exist"));
+    }
+    save_config(&config)
+}
+
+pub fn apply_profile(name: &str) -> Result<(), String> {
+    let mut config = load_config()?;
+    let profile = config
+        .profiles
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("profile {name:?} does not exist"))?;
+    let displays = discover_displays()?;
+    let desired = profile.iter().cloned().collect::<BTreeSet<_>>();
+    if desired.is_empty() {
+        return Err(format!("profile {name:?} has no displays"));
+    }
+    let present = displays
+        .iter()
+        .map(|display| display.device_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing = desired
+        .iter()
+        .filter(|path| !present.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "profile {name:?} requires unavailable displays: {}",
+            missing.join(", ")
+        ));
+    }
+    apply_active_set(&mut config, &displays, &desired)
+}
+
+pub fn restore_previous_active_set() -> Result<(), String> {
+    let mut config = load_config()?;
+    let desired = config
+        .previous_active
+        .clone()
+        .ok_or("no previous active-display set saved")?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let displays = discover_displays()?;
+    let present = displays
+        .iter()
+        .map(|display| display.device_path.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = desired.iter().find(|path| !present.contains(path.as_str())) {
+        return Err(format!(
+            "previous active-display set requires unavailable display: {missing}"
+        ));
+    }
+    apply_active_set(&mut config, &displays, &desired)
+}
+
+fn active_paths(displays: &[Display]) -> BTreeSet<String> {
+    displays
+        .iter()
+        .filter(|display| display.active)
+        .map(|display| display.device_path.clone())
+        .collect()
+}
+
+fn apply_active_set(
+    config: &mut Config,
+    displays: &[Display],
+    desired: &BTreeSet<String>,
+) -> Result<(), String> {
+    if desired.is_empty() {
+        return Err("refusing to disable the last active display".into());
+    }
+    let available = displays
+        .iter()
+        .map(|display| display.device_path.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = desired
+        .iter()
+        .find(|path| !available.contains(path.as_str()))
+    {
+        return Err(format!("display path is not available: {missing}"));
+    }
+
+    config.previous_active = Some(active_paths(displays).into_iter().collect());
+    save_config(config)?;
+
+    let paths = visible_monitor_paths(&display_config(QDC_ALL_PATHS)?)?
+        .into_iter()
+        .filter_map(|mut path| {
+            let display = display_from_path(&path).ok()?;
+            desired.contains(&display.device_path).then(|| {
+                path.flags |= 1;
+                path
+            })
+        })
+        .collect::<Vec<_>>();
+    if paths.len() != desired.len() {
+        return Err("display topology changed before apply; no change made".into());
+    }
+    let mut paths = paths;
+    clear_mode_indices(&mut paths);
+    let flags = SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES;
+    set_display_config(&paths, SDC_VALIDATE | flags, "validation")?;
+    set_display_config(&paths, SDC_APPLY | flags, "apply")
 }
 
 #[cfg(test)]
