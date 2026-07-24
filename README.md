@@ -50,6 +50,18 @@ this README, and the license. Extract it anywhere, then run
 use. Configuration remains in `%LOCALAPPDATA%\monitorctl\monitorctl.toml`, so
 upgrading the extracted folder does not replace profiles or aliases.
 
+To install the newest local `dist` package into `%USERPROFILE%\tools\monitorctl`,
+add it to your user `PATH`, and create a login-startup tray shortcut, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+Existing `PATH` entries and `Monitorctl.lnk` startup shortcuts are left alone.
+The tray utility starts after install; during an upgrade it is restarted after
+files are copied. Use `-NoStart`, `-NoStartup`, or
+`-InstallDirectory <path>` to change those defaults.
+
 `profile save` and `profile create` replace any same-named profile. Use
 `profile show <name>` to inspect one before applying or deleting it.
 
