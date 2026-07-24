@@ -79,10 +79,45 @@ work = ["\\\\?\\MONITOR#..."]
 
 [hotkeys]
 "ctrl+alt+w" = "profile:work"
+
+[osd]
+opacity = 0.85
 ```
 
 Profiles store exact Windows device paths, never display indexes or layout.
 ## Status
 
-Phase 3 CLI provides display discovery, aliases, enable/disable/toggle,
-profiles, and previous-active-set restore. See [roadmap](docs/roadmap.md).
+Phase 4 adds `monitorctl-tray`, a tray-only utility for Windows-visible
+monitors, profiles, restore, and configured global hotkeys. It uses a display
+alias as its menu label when configured; otherwise it uses the friendly name.
+Run it with:
+
+```powershell
+cargo run --bin monitorctl-tray
+```
+
+Hotkeys map `ctrl`, `alt`, `shift`, or `win` plus one letter/digit to actions:
+
+```toml
+[hotkeys]
+"ctrl+alt+w" = "profile:work"
+"ctrl+alt+d" = "toggle:desk"
+"ctrl+alt+r" = "restore"
+```
+
+Tray menu rebuilds on opening, so it reflects current Windows display state.
+Manage those entries with `monitorctl hotkey list`, `monitorctl hotkey set`, and
+`monitorctl hotkey delete`; restart the tray after changes.
+
+Tray results use a native lower-center OSD. Configure opacity from `0.10` to
+`1.00`, or preview it from CLI:
+
+```powershell
+monitorctl osd show
+monitorctl osd show "Custom string"
+monitorctl osd opacity 0.85
+```
+
+`osd show` stays open for two seconds, then exits. Tray success, error, and
+hotkey-conflict messages show for five seconds.
+See [roadmap](docs/roadmap.md).
