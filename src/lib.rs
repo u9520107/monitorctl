@@ -1,10 +1,24 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Write,
     mem::size_of,
+    os::windows::ffi::OsStrExt,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::{
+    Win32::{
+        Foundation::{
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
+        Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+    },
+    core::PCWSTR,
+};
 
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -16,6 +30,50 @@ use windows::Win32::Devices::Display::{
 };
 
 pub mod osd;
+
+const MONITORCTL_MUTEX_NAME: &str = "Local\\monitorctl-operation";
+const MONITORCTL_MUTEX_WAIT_MS: u32 = 10_000;
+static CONFIG_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct MonitorctlLock(HANDLE);
+
+impl MonitorctlLock {
+    fn acquire() -> Result<Self, String> {
+        let name = MONITORCTL_MUTEX_NAME
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+            .map_err(|error| format!("cannot serialize Monitorctl operation: {error}"))?;
+        match unsafe { WaitForSingleObject(handle, MONITORCTL_MUTEX_WAIT_MS) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
+            WAIT_TIMEOUT => {
+                unsafe { CloseHandle(handle) }.ok();
+                Err("another Monitorctl operation is in progress; try again".into())
+            }
+            result => {
+                unsafe { CloseHandle(handle) }.ok();
+                Err(format!(
+                    "cannot serialize Monitorctl operation: wait returned {result:?}"
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for MonitorctlLock {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.0).ok();
+            CloseHandle(self.0).ok();
+        }
+    }
+}
+
+fn with_monitorctl_lock<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _lock = MonitorctlLock::acquire()?;
+    action()
+}
 
 pub fn run_cli() -> Result<(), String> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
@@ -160,9 +218,11 @@ fn set_osd_opacity(value: &str) -> Result<(), String> {
         .parse::<f32>()
         .map_err(|_| "OSD opacity must be a number between 0.10 and 1.00")?;
     osd::validate_opacity(opacity)?;
-    let mut config = load_config()?;
-    config.osd.opacity = opacity;
-    save_config(&config)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        config.osd.opacity = opacity;
+        save_config(&config)
+    })
 }
 
 fn list() -> Result<(), String> {
@@ -259,18 +319,22 @@ fn list_hotkeys() -> Result<(), String> {
 fn set_hotkey(key: &str, action: &str) -> Result<(), String> {
     validate_hotkey(key)?;
     validate_hotkey_action(action)?;
-    let mut config = load_config()?;
-    warn_missing_hotkey_target(&config, action);
-    config.hotkeys.insert(key.into(), action.into());
-    save_config(&config)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        warn_missing_hotkey_target(&config, action);
+        config.hotkeys.insert(key.into(), action.into());
+        save_config(&config)
+    })
 }
 
 fn delete_hotkey(key: &str) -> Result<(), String> {
-    let mut config = load_config()?;
-    if config.hotkeys.remove(key).is_none() {
-        return Err(format!("hotkey {key:?} does not exist"));
-    }
-    save_config(&config)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        if config.hotkeys.remove(key).is_none() {
+            return Err(format!("hotkey {key:?} does not exist"));
+        }
+        save_config(&config)
+    })
 }
 
 pub fn validate_hotkey(key: &str) -> Result<(), String> {
@@ -517,11 +581,44 @@ pub fn load_config() -> Result<Config, String> {
 
 pub fn save_config(config: &Config) -> Result<(), String> {
     let path = config_path()?;
+    save_config_at(&path, config)
+}
+
+fn save_config_at(path: &Path, config: &Config) -> Result<(), String> {
     let directory = path.parent().expect("config path has parent");
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
-    std::fs::write(&path, config.to_toml()?)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+    let temporary = path.with_extension(format!(
+        "{}.{}.new",
+        std::process::id(),
+        CONFIG_TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        file.write_all(config.to_toml()?.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync {}: {error}", temporary.display()))?;
+        let temporary_wide = wide_path(&temporary);
+        let path_wide = wide_path(path);
+        unsafe {
+            MoveFileExW(
+                PCWSTR(temporary_wide.as_ptr()),
+                PCWSTR(path_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| format!("cannot replace {}: {error}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,31 +696,40 @@ fn display_from_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<Display, String> 
 }
 
 pub fn enable_display(selector: &str) -> Result<(), String> {
-    change_display(selector, true)
+    with_monitorctl_lock(|| change_display(selector, true))
 }
 
 pub fn disable_display(selector: &str) -> Result<(), String> {
-    change_display(selector, false)
+    with_monitorctl_lock(|| change_display(selector, false))
 }
 
 pub fn toggle_display(selector: &str) -> Result<(), String> {
-    let config = load_config()?;
-    let displays = discover_displays()?;
-    let display = resolve_display(&displays, &config.displays, selector)?;
-    change_display(selector, !display.active)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let displays = discover_displays()?;
+        let display = resolve_display(&displays, &config.displays, selector)?;
+        change_display_path(
+            &mut config,
+            &displays,
+            &display.device_path,
+            !display.active,
+        )
+    })
 }
 
 /// Toggle a Windows display identified by its exact device path.
 ///
 /// This is for UI callers that already selected one discovered display.
 pub fn toggle_display_path(device_path: &str) -> Result<(), String> {
-    let mut config = load_config()?;
-    let displays = discover_displays()?;
-    let display = displays
-        .iter()
-        .find(|display| display.device_path == device_path)
-        .ok_or_else(|| format!("display path is not available: {device_path}"))?;
-    change_display_path(&mut config, &displays, device_path, !display.active)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let displays = discover_displays()?;
+        let display = displays
+            .iter()
+            .find(|display| display.device_path == device_path)
+            .ok_or_else(|| format!("display path is not available: {device_path}"))?;
+        change_display_path(&mut config, &displays, device_path, !display.active)
+    })
 }
 
 fn change_display(selector: &str, active: bool) -> Result<(), String> {
@@ -662,17 +768,19 @@ pub fn create_profile(name: &str, selectors: &[String]) -> Result<(), String> {
         return Err("profile must include at least one display".into());
     }
 
-    let mut config = load_config()?;
-    let displays = discover_displays()?;
-    let mut paths = BTreeSet::new();
-    for selector in selectors {
-        let display = resolve_display(&displays, &config.displays, selector)?;
-        paths.insert(display.device_path.clone());
-    }
-    config
-        .profiles
-        .insert(name.into(), paths.into_iter().collect());
-    save_config(&config)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let displays = discover_displays()?;
+        let mut paths = BTreeSet::new();
+        for selector in selectors {
+            let display = resolve_display(&displays, &config.displays, selector)?;
+            paths.insert(display.device_path.clone());
+        }
+        config
+            .profiles
+            .insert(name.into(), paths.into_iter().collect());
+        save_config(&config)
+    })
 }
 
 pub fn save_profile(name: &str) -> Result<(), String> {
@@ -680,74 +788,82 @@ pub fn save_profile(name: &str) -> Result<(), String> {
         return Err("profile name cannot be empty".into());
     }
 
-    let mut config = load_config()?;
-    let active = active_paths(&discover_displays()?);
-    if active.is_empty() {
-        return Err("no active displays to save".into());
-    }
-    config
-        .profiles
-        .insert(name.into(), active.into_iter().collect());
-    save_config(&config)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let active = active_paths(&discover_displays()?);
+        if active.is_empty() {
+            return Err("no active displays to save".into());
+        }
+        config
+            .profiles
+            .insert(name.into(), active.into_iter().collect());
+        save_config(&config)
+    })
 }
 
 pub fn delete_profile(name: &str) -> Result<(), String> {
-    let mut config = load_config()?;
-    if config.profiles.remove(name).is_none() {
-        return Err(format!("profile {name:?} does not exist"));
-    }
-    save_config(&config)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        if config.profiles.remove(name).is_none() {
+            return Err(format!("profile {name:?} does not exist"));
+        }
+        save_config(&config)
+    })
 }
 
 pub fn apply_profile(name: &str) -> Result<(), String> {
-    let mut config = load_config()?;
-    let profile = config
-        .profiles
-        .get(name)
-        .cloned()
-        .ok_or_else(|| format!("profile {name:?} does not exist"))?;
-    let displays = discover_displays()?;
-    let desired = profile.iter().cloned().collect::<BTreeSet<_>>();
-    if desired.is_empty() {
-        return Err(format!("profile {name:?} has no displays"));
-    }
-    let present = displays
-        .iter()
-        .map(|display| display.device_path.as_str())
-        .collect::<BTreeSet<_>>();
-    let missing = desired
-        .iter()
-        .filter(|path| !present.contains(path.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "profile {name:?} requires unavailable displays: {}",
-            missing.join(", ")
-        ));
-    }
-    apply_active_set(&mut config, &displays, &desired)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let profile = config
+            .profiles
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("profile {name:?} does not exist"))?;
+        let displays = discover_displays()?;
+        let desired = profile.iter().cloned().collect::<BTreeSet<_>>();
+        if desired.is_empty() {
+            return Err(format!("profile {name:?} has no displays"));
+        }
+        let present = displays
+            .iter()
+            .map(|display| display.device_path.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = desired
+            .iter()
+            .filter(|path| !present.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "profile {name:?} requires unavailable displays: {}",
+                missing.join(", ")
+            ));
+        }
+        apply_active_set(&mut config, &displays, &desired)
+    })
 }
 
 pub fn restore_previous_active_set() -> Result<(), String> {
-    let mut config = load_config()?;
-    let desired = config
-        .previous_active
-        .clone()
-        .ok_or("no previous active-display set saved")?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let displays = discover_displays()?;
-    let present = displays
-        .iter()
-        .map(|display| display.device_path.as_str())
-        .collect::<BTreeSet<_>>();
-    if let Some(missing) = desired.iter().find(|path| !present.contains(path.as_str())) {
-        return Err(format!(
-            "previous active-display set requires unavailable display: {missing}"
-        ));
-    }
-    apply_active_set(&mut config, &displays, &desired)
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let desired = config
+            .previous_active
+            .clone()
+            .ok_or("no previous active-display set saved")?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let displays = discover_displays()?;
+        let present = displays
+            .iter()
+            .map(|display| display.device_path.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = desired.iter().find(|path| !present.contains(path.as_str())) {
+            return Err(format!(
+                "previous active-display set requires unavailable display: {missing}"
+            ));
+        }
+        apply_active_set(&mut config, &displays, &desired)
+    })
 }
 
 fn active_paths(displays: &[Display]) -> BTreeSet<String> {
@@ -958,5 +1074,36 @@ mod tests {
         assert_eq!(Config::default().osd.opacity, 0.85);
         assert_eq!(Config::from_toml("[osd]").unwrap().osd.opacity, 0.85);
         assert!(Config::from_toml("[osd]\nopacity = 0.09").is_err());
+    }
+
+    #[test]
+    fn replaces_config_file_after_writing_complete_toml() {
+        let path =
+            std::env::temp_dir().join(format!("monitorctl-test-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut config = Config::default();
+        config.displays.insert("desk".into(), "path-1".into());
+        save_config_at(&path, &config).unwrap();
+        config.displays.insert("laptop".into(), "path-2".into());
+        save_config_at(&path, &config).unwrap();
+
+        assert_eq!(
+            Config::from_toml(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .displays,
+            config.displays
+        );
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !(name.starts_with("monitorctl-test-") && name.ends_with(".new"))
+                })
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -42,6 +42,14 @@ cargo run -- profile create focus --active desk,laptop
 cargo run -- profile apply work
 ```
 
+## Portable package
+
+The portable Windows ZIP contains `monitorctl.exe`, `monitorctl-tray.exe`,
+this README, and the license. Extract it anywhere, then run
+`monitorctl-tray.exe` for the tray utility or `monitorctl.exe --help` for CLI
+use. Configuration remains in `%LOCALAPPDATA%\monitorctl\monitorctl.toml`, so
+upgrading the extracted folder does not replace profiles or aliases.
+
 `profile save` and `profile create` replace any same-named profile. Use
 `profile show <name>` to inspect one before applying or deleting it.
 
@@ -85,11 +93,11 @@ opacity = 0.85
 ```
 
 Profiles store exact Windows device paths, never display indexes or layout.
-## Status
+## Tray utility
 
-Phase 4 adds `monitorctl-tray`, a tray-only utility for Windows-visible
-monitors, profiles, restore, and configured global hotkeys. It uses a display
-alias as its menu label when configured; otherwise it uses the friendly name.
+`monitorctl-tray` is a tray-only utility for Windows-visible monitors,
+profiles, restore, and configured global hotkeys. It uses a display alias as
+its menu label when configured; otherwise it uses the friendly name.
 Run it with:
 
 ```powershell
