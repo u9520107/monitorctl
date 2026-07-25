@@ -140,4 +140,4 @@ monitorctl osd opacity 0.85
 
 `osd show` stays open for two seconds, then exits. Tray success, error, and
 hotkey-conflict messages show for five seconds.
-See [roadmap](docs/roadmap.md).
+See [color profile proposal](docs/color-profile-plan.md) for planned ICC-profile support.
