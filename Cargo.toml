@@ -14,15 +14,18 @@ path = "src/tray.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 toml = "0.9"
 windows = { version = "0.62.2", features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_UI_ColorSystem",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
 ] }

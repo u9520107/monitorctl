@@ -32,40 +32,88 @@ aliases, active state, and device paths.
 
 ## CLI
 
-Run `monitorctl --help` for command reference, or `monitorctl profile --help`
-for profile management. Typical profile workflow:
+Run `monitorctl --help` for command reference. Commands that change display
+state apply immediately.
+
+### Displays
 
 ```powershell
-cargo run -- list
-cargo run -- profile save work
-cargo run -- profile create focus --active desk,laptop
-cargo run -- profile apply work
+monitorctl list
+monitorctl enable desk
+monitorctl disable laptop
+monitorctl toggle desk
+monitorctl restore
+```
+
+`list` is read-only. `restore` restores the active-display set from before the
+last successful display change. `disable` and `toggle` refuse to leave Windows
+with no active displays.
+
+### Active-display profiles
+
+Save current active displays, create one from selectors, inspect it, apply it,
+or delete it:
+
+```powershell
+monitorctl profile save work
+monitorctl profile create focus --active desk,laptop
+monitorctl profile list
+monitorctl profile show work
+monitorctl profile apply work
+monitorctl profile delete work
+```
+
+`save` and `create` replace a same-named profile. `apply` fails without
+changing Windows state when any saved display is unavailable.
+
+### Hotkeys
+
+Configure hotkeys for tray utility, then restart it:
+
+```powershell
+monitorctl hotkey list
+monitorctl hotkey set ctrl+alt+w profile:work
+monitorctl hotkey set ctrl+alt+d toggle:desk
+monitorctl hotkey set ctrl+alt+r restore
+monitorctl hotkey delete ctrl+alt+r
+```
+
+Keys require `ctrl`, `alt`, `shift`, or `win`, plus one letter or digit.
+
+### On-screen display
+
+```powershell
+monitorctl osd show
+monitorctl osd show "Displays ready"
+monitorctl osd opacity 0.85
 ```
 
 ## Portable package
 
-The portable Windows ZIP contains `monitorctl.exe`, `monitorctl-tray.exe`,
+The portable Windows package contains `monitorctl.exe`, `monitorctl-tray.exe`,
 this README, and the license. Extract it anywhere, then run
-`monitorctl-tray.exe` for the tray utility or `monitorctl.exe --help` for CLI
-use. Configuration remains in `%LOCALAPPDATA%\monitorctl\monitorctl.toml`, so
-upgrading the extracted folder does not replace profiles or aliases.
+`monitorctl-tray.exe` for tray utility or `monitorctl.exe --help` for CLI use.
+Configuration remains in `%LOCALAPPDATA%\monitorctl\monitorctl.toml`, so
+upgrading extracted folder does not replace profiles or aliases.
 
-To install the newest local `dist` package into `%USERPROFILE%\tools\monitorctl`,
-add it to your user `PATH`, and create a login-startup tray shortcut, run:
+Create fresh package from source, then install it into
+`%USERPROFILE%\tools\monitorctl`, add it to user `PATH`, and create login-startup
+tray shortcut:
 
 ```powershell
+.\scripts\package.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
+
+`package.ps1` requires Rust, MSVC, and Windows SDK. `install.ps1` only installs
+newest complete package already in `dist`; it does not build source code.
 
 Existing `PATH` entries and `Monitorctl.lnk` startup shortcuts are left alone.
 The tray utility starts after install; during an upgrade it is restarted after
 files are copied. Use `-NoStart`, `-NoStartup`, or
 `-InstallDirectory <path>` to change those defaults.
 
-`profile save` and `profile create` replace any same-named profile. Use
-`profile show <name>` to inspect one before applying or deleting it.
-
-All display-changing commands apply immediately. Each command is explicit;
+Each command is explicit;
 Monitorctl has no background state repair. It refuses to disable final active
 display. Run topology commands from local interactive Windows desktop; remote
 or non-desktop sessions cannot call `SetDisplayConfig`.
@@ -105,6 +153,37 @@ opacity = 0.85
 ```
 
 Profiles store exact Windows device paths, never display indexes or layout.
+
+## Color profiles
+
+ICC color profiles are independent from display profiles. They change only the
+current user's Windows color association for one active monitor; they never
+change monitor layout or active-display state. Windows advanced color uses an
+advanced ICC profile; SDR uses a normal profile.
+
+```powershell
+monitorctl color import "C:\Profiles\Dell-U2723QE-2026.icc"
+monitorctl color list
+monitorctl color current desk
+monitorctl color set desk "Dell-U2723QE"
+```
+
+Color commands require Windows 11. `color list` shows all installed `.icc` and
+`.icm` files with detected channel or `unsupported`. `color import` installs an
+ICC file unless identical bytes already exist. It rejects files whose name
+collides with different installed contents. `color set` accepts an exact
+filename or unique case-insensitive filename substring, checks profile channel,
+then makes it current for that monitor. Windows' profile store is the source of
+truth; changing display topology may require another explicit `color set`.
+
+When Windows currently uses system color settings for a display, explicit
+`color set` enables current-user settings for that display before applying the
+profile. Tray's `Use system color settings` switches display back to Windows'
+system settings; it does not remove installed ICC files.
+
+`color current` reports `Windows default` when Windows reports no explicit ICC
+association for monitor's active color channel.
+
 ## Tray utility
 
 `monitorctl-tray` is a tray-only utility for Windows-visible monitors,
@@ -140,4 +219,3 @@ monitorctl osd opacity 0.85
 
 `osd show` stays open for two seconds, then exits. Tray success, error, and
 hotkey-conflict messages show for five seconds.
-See [color profile proposal](docs/color-profile-plan.md) for planned ICC-profile support.

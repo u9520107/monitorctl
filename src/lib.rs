@@ -29,6 +29,7 @@ use windows::Win32::Devices::Display::{
     SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE, SET_DISPLAY_CONFIG_FLAGS, SetDisplayConfig,
 };
 
+pub mod color;
 pub mod osd;
 
 const MONITORCTL_MUTEX_NAME: &str = "Local\\monitorctl-operation";
@@ -83,6 +84,7 @@ pub fn run_cli() -> Result<(), String> {
         [command, topic] if command == "help" && topic == "profile" => print_help(profile_help()),
         [command, topic] if command == "help" && topic == "hotkey" => print_help(hotkey_help()),
         [command, topic] if command == "help" && topic == "osd" => print_help(osd_help()),
+        [command, topic] if command == "help" && topic == "color" => print_help(color_help()),
         [topic, command]
             if topic == "profile" && matches!(command.as_str(), "--help" | "-h" | "help") =>
         {
@@ -97,6 +99,11 @@ pub fn run_cli() -> Result<(), String> {
             if topic == "osd" && matches!(command.as_str(), "--help" | "-h" | "help") =>
         {
             print_help(osd_help())
+        }
+        [topic, command]
+            if topic == "color" && matches!(command.as_str(), "--help" | "-h" | "help") =>
+        {
+            print_help(color_help())
         }
         [] => list(),
         [command] if command == "list" => list(),
@@ -126,6 +133,14 @@ pub fn run_cli() -> Result<(), String> {
         [command, action, opacity] if command == "osd" && action == "opacity" => {
             set_osd_opacity(opacity)
         }
+        [command, action] if command == "color" && action == "list" => color::list(),
+        [command, action, path] if command == "color" && action == "import" => color::import(path),
+        [command, action, monitor] if command == "color" && action == "current" => {
+            color::current(monitor)
+        }
+        [command, action, monitor, file] if command == "color" && action == "set" => {
+            color::set(monitor, file)
+        }
         _ => Err(usage()),
     }
 }
@@ -152,6 +167,7 @@ Commands:\n\
   profile <command>            Manage named active-display sets\n\
   hotkey <command>             Manage tray global-hotkey configuration\n\
   osd <command>                Show OSD or set its opacity\n\
+  color <command>              Manage per-monitor ICC profiles\n\
   help, --help, -h             Show this help\n\
 \n\
 Display selectors: exact alias, exact friendly name, then unique\n\
@@ -165,6 +181,21 @@ Profile workflow:\n\
   monitorctl profile show work\n\
 \n\
 Run `monitorctl profile --help` for profile commands.\n"
+}
+
+fn color_help() -> &'static str {
+    "\
+Usage: monitorctl color <command>\n\
+\n\
+Commands:\n\
+  list                                      List installed ICC profiles\n\
+  import <path>                             Install an ICC profile\n\
+  current <monitor>                         Show current profile and color channel\n\
+  set <monitor> <profile-file>              Set current-user profile for a monitor\n\
+\n\
+Profiles remain separate from active-display profiles. `set` accepts an exact\n\
+filename or unique case-insensitive filename substring. It requires a normal\n\
+profile for SDR or an advanced profile for Windows advanced color.\n"
 }
 
 fn profile_help() -> &'static str {
@@ -528,6 +559,13 @@ pub struct Config {
     pub osd: OsdConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_active: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorChannel {
+    Normal,
+    Advanced,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1060,6 +1098,7 @@ mod tests {
         assert!(profile_help().contains("create <name>"));
         assert!(hotkey_help().contains("set <key> <action>"));
         assert!(osd_help().contains("opacity"));
+        assert!(color_help().contains("import <path>"));
     }
 
     #[test]

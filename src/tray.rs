@@ -21,7 +21,7 @@ use windows::{
                 AppendMenuW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu,
                 CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
                 GetCursorPos, GetMessageW, HMENU, IMAGE_FLAGS, MENU_ITEM_FLAGS, MF_CHECKED,
-                MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
+                MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
                 RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_RIGHTBUTTON,
                 TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
                 WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
@@ -35,6 +35,7 @@ const CLASS_NAME: &str = "monitorctl-tray";
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const MENU_MONITOR_BASE: u32 = 1_000;
 const MENU_PROFILE_BASE: u32 = 2_000;
+const MENU_COLOR_BASE: u32 = 2_500;
 const MENU_RESTORE: u32 = 3_000;
 const MENU_QUIT: u32 = 3_001;
 const HOTKEY_BASE: i32 = 4_000;
@@ -58,6 +59,14 @@ enum MenuAction {
         active: bool,
     },
     Profile(String),
+    Color {
+        path: String,
+        file: String,
+    },
+    SystemColor {
+        path: String,
+        label: String,
+    },
     Restore,
 }
 
@@ -207,6 +216,63 @@ unsafe fn show_menu(window: HWND) {
             MenuAction::Profile(profile.name.clone()),
         );
     }
+    if !state.colors.is_empty() {
+        append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING | MF_DISABLED, 0, "Color profiles");
+        let mut color_id = MENU_COLOR_BASE;
+        for color in &state.colors {
+            let Ok(submenu) = CreatePopupMenu() else {
+                continue;
+            };
+            append_submenu(menu, submenu, &color.label);
+            append(
+                submenu,
+                MF_STRING
+                    | if color.uses_current_user_settings {
+                        MENU_ITEM_FLAGS(0)
+                    } else {
+                        MF_CHECKED
+                    },
+                color_id,
+                "Use system color settings",
+            );
+            menu_actions.insert(
+                color_id,
+                MenuAction::SystemColor {
+                    path: color.path.clone(),
+                    label: color.label.clone(),
+                },
+            );
+            color_id += 1;
+            append(submenu, MF_SEPARATOR, 0, "");
+            for file in &color.profiles {
+                let active = color.uses_current_user_settings
+                    && color
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| file.eq_ignore_ascii_case(current));
+                append(
+                    submenu,
+                    MF_STRING
+                        | if active {
+                            MF_CHECKED
+                        } else {
+                            MENU_ITEM_FLAGS(0)
+                        },
+                    color_id,
+                    file,
+                );
+                menu_actions.insert(
+                    color_id,
+                    MenuAction::Color {
+                        path: color.path.clone(),
+                        file: file.clone(),
+                    },
+                );
+                color_id += 1;
+            }
+        }
+    }
     append(menu, MF_SEPARATOR, 0, "");
     append(
         menu,
@@ -216,7 +282,7 @@ unsafe fn show_menu(window: HWND) {
             MF_STRING | MF_GRAYED
         },
         MENU_RESTORE,
-        "Restore",
+        "Restore displays",
     );
     menu_actions.insert(MENU_RESTORE, MenuAction::Restore);
     append(menu, MF_STRING, MENU_QUIT, "Quit");
@@ -239,6 +305,16 @@ unsafe fn show_menu(window: HWND) {
 unsafe fn append(menu: HMENU, flags: MENU_ITEM_FLAGS, id: u32, label: &str) {
     let label = wide(label);
     let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(label.as_ptr()));
+}
+
+unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
+    let label = wide(label);
+    let _ = AppendMenuW(
+        menu,
+        MF_POPUP | MF_STRING,
+        submenu.0 as usize,
+        PCWSTR(label.as_ptr()),
+    );
 }
 
 unsafe fn run_menu_action(window: HWND, command: u32) {
@@ -271,6 +347,14 @@ unsafe fn run_menu_action(window: HWND, command: u32) {
         Some(MenuAction::Profile(name)) => (
             monitorctl_core::apply_profile(&name),
             format!("Applied profile {name}"),
+        ),
+        Some(MenuAction::Color { path, file }) => (
+            monitorctl_core::color::set_path(&path, &file),
+            format!("Applied color profile {file}"),
+        ),
+        Some(MenuAction::SystemColor { path, label }) => (
+            monitorctl_core::color::use_system_settings_for_path(&path),
+            format!("Using system color settings for {label}"),
         ),
         None => return,
     };
@@ -431,6 +515,7 @@ fn parse_hotkey(value: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 struct MenuState {
     displays: Vec<MenuDisplay>,
     profiles: Vec<MenuProfile>,
+    colors: Vec<MenuColor>,
     active_count: usize,
     restore_available: bool,
 }
@@ -450,6 +535,14 @@ struct MenuProfile {
 
 struct MenuProfileDisplay {
     label: String,
+}
+
+struct MenuColor {
+    label: String,
+    path: String,
+    uses_current_user_settings: bool,
+    current: Option<String>,
+    profiles: Vec<String>,
 }
 
 fn menu_state() -> std::result::Result<MenuState, String> {
@@ -519,12 +612,39 @@ fn menu_state() -> std::result::Result<MenuState, String> {
             }
         })
         .collect();
+    let colors = discovered
+        .iter()
+        .filter(|display| display.active)
+        .filter_map(|display| {
+            let alias = config
+                .displays
+                .iter()
+                .find_map(|(alias, path)| (path == &display.device_path).then_some(alias.as_str()));
+            let label = display_label(alias, &display.friendly_name);
+            let profiles = monitorctl_core::color::safe_profiles_for_path(&display.device_path)
+                .unwrap_or_default();
+            (!profiles.is_empty()).then(|| MenuColor {
+                label,
+                path: display.device_path.clone(),
+                uses_current_user_settings:
+                    monitorctl_core::color::uses_current_user_settings_for_path(
+                        &display.device_path,
+                    )
+                    .unwrap_or(false),
+                current: monitorctl_core::color::current_for_path(&display.device_path)
+                    .ok()
+                    .flatten(),
+                profiles,
+            })
+        })
+        .collect();
     let restore_available = config.previous_active.as_ref().is_some_and(|paths| {
         !paths.is_empty() && paths.iter().all(|path| present.contains(path.as_str()))
     });
     Ok(MenuState {
         displays,
         profiles,
+        colors,
         active_count: active.len(),
         restore_available,
     })
