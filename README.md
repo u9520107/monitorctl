@@ -74,11 +74,14 @@ Configure hotkeys for tray utility, then restart it:
 monitorctl hotkey list
 monitorctl hotkey set ctrl+alt+w profile:work
 monitorctl hotkey set ctrl+alt+d toggle:desk
+monitorctl hotkey set ctrl+win+shift+1 color:m32q "HDR Cali"
 monitorctl hotkey set ctrl+alt+r restore
 monitorctl hotkey delete ctrl+alt+r
 ```
 
 Keys require `ctrl`, `alt`, `shift`, or `win`, plus one letter or digit.
+`toggle:<monitor>` and `color:<monitor> <file>` resolve monitor identity and
+full installed filename when saved. Restart tray after every hotkey change.
 
 ### On-screen display
 
@@ -136,14 +139,17 @@ Monitorctl stores aliases, profiles, hotkeys, and the previous active set in:
 %LOCALAPPDATA%\monitorctl\monitorctl.toml
 ```
 
-Create file to map aliases to paths printed by `list`:
+Create file to map aliases to monitor identity printed by `list`:
 
 ```toml
-[displays]
-desk = "\\\\?\\MONITOR#..."
+[displays.desk]
+path = "\\\\?\\DISPLAY#GBT3203#..."
+friendly_name = "Gigabyte M32Q"
 
-[profiles]
-work = ["\\\\?\\MONITOR#..."]
+[displays.desk.serial]
+manufacturer_id = 21532
+product_code = 12803
+serial = 2461
 
 [hotkeys]
 "ctrl+alt+w" = "profile:work"
@@ -152,7 +158,14 @@ work = ["\\\\?\\MONITOR#..."]
 opacity = 0.85
 ```
 
-Profiles store exact Windows device paths, never display indexes or layout.
+Profiles and aliases store monitor identity, never display indexes or layout.
+When EDID supplies a nonzero serial, Monitorctl matches manufacturer, product,
+and serial across port or topology changes. Otherwise it prefers saved Windows
+path, then uses an exact friendly-name match only when unique. Ambiguous
+serial-less matches fail.
+
+Old path-only config entries remain valid. Re-save a profile after upgrading to
+capture serial and friendly-name identity data.
 
 ## Color profiles
 

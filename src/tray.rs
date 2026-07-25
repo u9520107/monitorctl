@@ -7,7 +7,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use monitorctl_core::{Display, discover_displays, load_config};
+use monitorctl_core::{
+    Display, HotkeyAction, discover_displays, load_config, resolve_identities, resolve_identity,
+};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -47,7 +49,7 @@ static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
 #[derive(Default)]
 struct TrayState {
-    hotkeys: BTreeMap<i32, String>,
+    hotkeys: BTreeMap<i32, HotkeyAction>,
     menu_actions: BTreeMap<u32, MenuAction>,
 }
 
@@ -409,29 +411,42 @@ unsafe fn run_hotkey(_window: HWND, id: i32) {
     show_result(result, &success);
 }
 
-fn action_summary(action: &str) -> String {
+fn action_summary(action: &HotkeyAction) -> String {
     match action {
-        "restore" => "Restored previous display set".into(),
-        action if let Some(name) = action.strip_prefix("profile:") => {
+        HotkeyAction::Restore => "Restored previous display set".into(),
+        HotkeyAction::Profile { name } => {
             format!("Applied profile {name}")
         }
-        action if let Some(display) = action.strip_prefix("toggle:") => {
-            format!("Toggled {display}")
-        }
-        _ => "Done".into(),
+        HotkeyAction::Toggle { display } => format!(
+            "Toggled {}",
+            display
+                .friendly_name
+                .as_deref()
+                .unwrap_or(&display.device_path)
+        ),
+        HotkeyAction::Color { file, .. } => format!("Applied color profile {file}"),
+        HotkeyAction::Legacy { action } => format!("Legacy hotkey: {action}"),
     }
 }
 
-fn run_action(action: &str) -> std::result::Result<(), String> {
+fn run_action(action: &HotkeyAction) -> std::result::Result<(), String> {
     match action {
-        "restore" => monitorctl_core::restore_previous_active_set(),
-        action if let Some(name) = action.strip_prefix("profile:") => {
+        HotkeyAction::Restore => monitorctl_core::restore_previous_active_set(),
+        HotkeyAction::Profile { name } => monitorctl_core::apply_profile(name),
+        HotkeyAction::Toggle { display } => monitorctl_core::toggle_display_identity(display),
+        HotkeyAction::Color { display, file } => {
+            monitorctl_core::color::set_identity(display, file)
+        }
+        HotkeyAction::Legacy { action } if action == "restore" => {
+            monitorctl_core::restore_previous_active_set()
+        }
+        HotkeyAction::Legacy { action } if let Some(name) = action.strip_prefix("profile:") => {
             monitorctl_core::apply_profile(name)
         }
-        action if let Some(display) = action.strip_prefix("toggle:") => {
+        HotkeyAction::Legacy { action } if let Some(display) = action.strip_prefix("toggle:") => {
             monitorctl_core::toggle_display(display)
         }
-        _ => Err(format!("unknown hotkey action: {action}")),
+        HotkeyAction::Legacy { action } => Err(format!("unknown hotkey action: {action}")),
     }
 }
 
@@ -549,17 +564,10 @@ fn menu_state() -> std::result::Result<MenuState, String> {
     let config = load_config()?;
     let discovered = discover_displays()?;
     let active = active_paths(&discovered);
-    let present = discovered
-        .iter()
-        .map(|display| display.device_path.as_str())
-        .collect::<BTreeSet<_>>();
     let mut displays = discovered
         .iter()
         .map(|display| {
-            let alias = config
-                .displays
-                .iter()
-                .find_map(|(alias, path)| (path == &display.device_path).then_some(alias.as_str()));
+            let alias = alias_for_display(&config, &discovered, display);
             MenuDisplay {
                 label: display_label(alias, &display.friendly_name),
                 path: Some(display.device_path.clone()),
@@ -571,7 +579,7 @@ fn menu_state() -> std::result::Result<MenuState, String> {
         config
             .displays
             .iter()
-            .filter(|(_, path)| !present.contains(path.as_str()))
+            .filter(|(_, identity)| resolve_identity(&discovered, identity).is_err())
             .map(|(alias, _)| MenuDisplay {
                 label: format!("{alias}  Unavailable"),
                 path: None,
@@ -581,34 +589,32 @@ fn menu_state() -> std::result::Result<MenuState, String> {
     let profiles = config
         .profiles
         .iter()
-        .map(|(name, paths)| {
-            let displays = paths
+        .map(|(name, identities)| {
+            let displays = identities
                 .iter()
-                .map(|path| {
-                    let label = discovered
-                        .iter()
-                        .find(|display| display.device_path == *path)
+                .map(|identity| {
+                    let label = resolve_identity(&discovered, identity)
                         .map(|display| {
-                            let alias = config.displays.iter().find_map(|(alias, value)| {
-                                (value == path).then_some(alias.as_str())
-                            });
-                            display_label(alias, &display.friendly_name)
+                            display_label(
+                                alias_for_display(&config, &discovered, display),
+                                &display.friendly_name,
+                            )
                         })
-                        .or_else(|| {
-                            config.displays.iter().find_map(|(alias, value)| {
-                                (value == path).then_some(format!("{alias}  Unavailable"))
-                            })
-                        })
-                        .unwrap_or_else(|| "Unavailable display".into());
+                        .unwrap_or_else(|_| {
+                            identity
+                                .friendly_name
+                                .clone()
+                                .unwrap_or_else(|| "Unavailable display".into())
+                        });
                     MenuProfileDisplay { label }
                 })
                 .collect();
+            let resolved = resolve_identities(&discovered, identities);
             MenuProfile {
                 name: name.clone(),
                 displays,
-                available: !paths.is_empty()
-                    && paths.iter().all(|path| present.contains(path.as_str())),
-                active: paths.iter().cloned().collect::<BTreeSet<_>>() == active,
+                available: !identities.is_empty() && resolved.is_ok(),
+                active: resolved.is_ok_and(|paths| paths == active),
             }
         })
         .collect();
@@ -616,10 +622,7 @@ fn menu_state() -> std::result::Result<MenuState, String> {
         .iter()
         .filter(|display| display.active)
         .filter_map(|display| {
-            let alias = config
-                .displays
-                .iter()
-                .find_map(|(alias, path)| (path == &display.device_path).then_some(alias.as_str()));
+            let alias = alias_for_display(&config, &discovered, display);
             let label = display_label(alias, &display.friendly_name);
             let profiles = monitorctl_core::color::safe_profiles_for_path(&display.device_path)
                 .unwrap_or_default();
@@ -638,8 +641,8 @@ fn menu_state() -> std::result::Result<MenuState, String> {
             })
         })
         .collect();
-    let restore_available = config.previous_active.as_ref().is_some_and(|paths| {
-        !paths.is_empty() && paths.iter().all(|path| present.contains(path.as_str()))
+    let restore_available = config.previous_active.as_ref().is_some_and(|identities| {
+        !identities.is_empty() && resolve_identities(&discovered, identities).is_ok()
     });
     Ok(MenuState {
         displays,
@@ -647,6 +650,19 @@ fn menu_state() -> std::result::Result<MenuState, String> {
         colors,
         active_count: active.len(),
         restore_available,
+    })
+}
+
+fn alias_for_display<'a>(
+    config: &'a monitorctl_core::Config,
+    displays: &[Display],
+    display: &Display,
+) -> Option<&'a str> {
+    config.displays.iter().find_map(|(alias, identity)| {
+        resolve_identity(displays, identity)
+            .ok()
+            .is_some_and(|candidate| candidate.device_path == display.device_path)
+            .then_some(alias.as_str())
     })
 }
 
@@ -695,7 +711,21 @@ mod tests {
 
     #[test]
     fn summarizes_hotkey_actions() {
-        assert_eq!(action_summary("profile:work"), "Applied profile work");
-        assert_eq!(action_summary("toggle:desk"), "Toggled desk");
+        assert_eq!(
+            action_summary(&monitorctl_core::HotkeyAction::Profile {
+                name: "work".into()
+            }),
+            "Applied profile work"
+        );
+        assert_eq!(
+            action_summary(&monitorctl_core::HotkeyAction::Toggle {
+                display: monitorctl_core::DisplayIdentity {
+                    device_path: "desk".into(),
+                    friendly_name: Some("desk".into()),
+                    serial: None,
+                },
+            }),
+            "Toggled desk"
+        );
     }
 }

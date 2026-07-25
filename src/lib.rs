@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, WAIT_ABANDONED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
-        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+        System::{
+            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RegGetValueW},
+            Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+        },
     },
     core::PCWSTR,
 };
@@ -125,7 +128,10 @@ pub fn run_cli() -> Result<(), String> {
         }
         [command, action] if command == "hotkey" && action == "list" => list_hotkeys(),
         [command, action, key, target] if command == "hotkey" && action == "set" => {
-            set_hotkey(key, target)
+            set_hotkey(key, target, None)
+        }
+        [command, action, key, target, file] if command == "hotkey" && action == "set" => {
+            set_hotkey(key, target, Some(file))
         }
         [command, action, key] if command == "hotkey" && action == "delete" => delete_hotkey(key),
         [command, action] if command == "osd" && action == "show" => show_osd("Monitorctl"),
@@ -221,13 +227,15 @@ Usage: monitorctl hotkey <command>\n\
 \n\
 Commands:\n\
   list                                  List configured hotkeys\n\
-  set <key> <action>                    Set or replace one hotkey\n\
+  set <key> restore                     Set restore hotkey\n\
+  set <key> profile:<name>              Set profile hotkey\n\
+  set <key> toggle:<monitor>            Set monitor-toggle hotkey\n\
+  set <key> color:<monitor> <file>      Set color-profile hotkey\n\
   delete <key>                          Delete one hotkey\n\
 \n\
 Keys require one or more of ctrl, alt, shift, or win plus one letter or digit.\n\
-Actions: restore, profile:<name>, or toggle:<display>. Missing profile or\n\
-display targets warn but do not prevent saving. Restart monitorctl-tray after\n\
-changes.\n"
+Toggle and color targets resolve when saved and use durable monitor identity.\n\
+Restart monitorctl-tray after changes.\n"
 }
 
 fn osd_help() -> &'static str {
@@ -258,14 +266,20 @@ fn set_osd_opacity(value: &str) -> Result<(), String> {
 
 fn list() -> Result<(), String> {
     let config = load_config()?;
-    for display in discover_displays()? {
+    let displays = discover_displays()?;
+    for display in &displays {
         let aliases = config
             .displays
             .iter()
-            .filter_map(|(alias, path)| (path == &display.device_path).then_some(alias.as_str()))
+            .filter_map(|(alias, identity)| {
+                resolve_identity(&displays, identity)
+                    .ok()
+                    .is_some_and(|candidate| candidate.device_path == display.device_path)
+                    .then_some(alias.as_str())
+            })
             .collect::<Vec<_>>();
         println!(
-            "{}\n  active: {}\n  alias: {}\n  path: {}",
+            "{}\n  active: {}\n  alias: {}\n  identity: {}\n  path: {}",
             display_name(&display),
             display.active,
             if aliases.is_empty() {
@@ -273,6 +287,7 @@ fn list() -> Result<(), String> {
             } else {
                 aliases.join(", ")
             },
+            display_identity_label(&display),
             display.device_path,
         );
     }
@@ -285,6 +300,20 @@ fn display_name(display: &Display) -> &str {
     } else {
         &display.friendly_name
     }
+}
+
+fn display_identity_label(display: &Display) -> String {
+    display
+        .identity
+        .serial
+        .as_ref()
+        .map(|serial| {
+            format!(
+                "EDID {:04X}-{:04X}-{}",
+                serial.manufacturer_id, serial.product_code, serial.serial
+            )
+        })
+        .unwrap_or_else(|| "path and friendly name".into())
 }
 
 fn profile_selectors(value: &str) -> Vec<String> {
@@ -300,44 +329,42 @@ fn list_profiles() -> Result<(), String> {
     let config = load_config()?;
     let displays = discover_displays()?;
     let active = active_paths(&displays);
-    let present = displays
-        .iter()
-        .map(|display| display.device_path.as_str())
-        .collect::<BTreeSet<_>>();
-
-    for (name, paths) in &config.profiles {
-        let desired = paths.iter().cloned().collect::<BTreeSet<_>>();
-        let status = if desired == active {
-            "  [active]"
-        } else if paths.iter().any(|path| !present.contains(path.as_str())) {
-            "  [unavailable]"
-        } else {
-            ""
+    for (name, identities) in &config.profiles {
+        let desired = resolve_identities(&displays, identities);
+        let status = match &desired {
+            Ok(desired) if desired == &active => "  [active]",
+            Err(_) => "  [unavailable]",
+            _ => "",
         };
         println!("{name}{status}");
-        for path in paths {
-            println!("  - {}", profile_display_name(&config, &displays, path));
+        for identity in identities {
+            println!("  - {}", profile_display_name(&config, &displays, identity));
         }
     }
     Ok(())
 }
 
-fn profile_display_name(config: &Config, displays: &[Display], path: &str) -> String {
+fn profile_display_name(
+    config: &Config,
+    displays: &[Display],
+    identity: &DisplayIdentity,
+) -> String {
+    let Ok(display) = resolve_identity(displays, identity) else {
+        return identity
+            .friendly_name
+            .clone()
+            .unwrap_or_else(|| "Unavailable display".into());
+    };
     config
         .displays
         .iter()
-        .find_map(|(alias, value)| (value == path).then_some(alias.clone()))
-        .or_else(|| {
-            displays
-                .iter()
-                .find(|display| display.device_path == path)
-                .map(|display| {
-                    (!display.friendly_name.is_empty())
-                        .then_some(display.friendly_name.clone())
-                        .unwrap_or_else(|| "(unnamed monitor)".into())
-                })
+        .find_map(|(alias, value)| {
+            resolve_identity(displays, value)
+                .ok()
+                .is_some_and(|candidate| candidate.device_path == display.device_path)
+                .then_some(alias.clone())
         })
-        .unwrap_or_else(|| "Unavailable display".into())
+        .unwrap_or_else(|| display_name(display).into())
 }
 
 fn list_hotkeys() -> Result<(), String> {
@@ -347,14 +374,64 @@ fn list_hotkeys() -> Result<(), String> {
     Ok(())
 }
 
-fn set_hotkey(key: &str, action: &str) -> Result<(), String> {
+fn set_hotkey(key: &str, action: &str, file: Option<&str>) -> Result<(), String> {
     validate_hotkey(key)?;
-    validate_hotkey_action(action)?;
     with_monitorctl_lock(|| {
         let mut config = load_config()?;
-        warn_missing_hotkey_target(&config, action);
-        config.hotkeys.insert(key.into(), action.into());
-        save_config(&config)
+        let stored = match action {
+            "restore" if file.is_none() => HotkeyAction::Restore,
+            action
+                if file.is_none()
+                    && action
+                        .strip_prefix("profile:")
+                        .is_some_and(|name| !name.is_empty()) =>
+            {
+                let name = action.strip_prefix("profile:").unwrap();
+                if !config.profiles.contains_key(name) {
+                    eprintln!("warning: profile {name:?} does not exist yet; hotkey saved");
+                }
+                HotkeyAction::Profile { name: name.into() }
+            }
+            action
+                if file.is_none()
+                    && action
+                        .strip_prefix("toggle:")
+                        .is_some_and(|selector| !selector.is_empty()) =>
+            {
+                let displays = discover_displays()?;
+                let display = resolve_display(
+                    &displays,
+                    &config.displays,
+                    action.strip_prefix("toggle:").unwrap(),
+                )?;
+                HotkeyAction::Toggle {
+                    display: display.identity.clone(),
+                }
+            }
+            action
+                if file.is_some()
+                    && action
+                        .strip_prefix("color:")
+                        .is_some_and(|selector| !selector.is_empty()) =>
+            {
+                let displays = discover_displays()?;
+                let display = resolve_display(
+                    &displays,
+                    &config.displays,
+                    action.strip_prefix("color:").unwrap(),
+                )?;
+                let file = color::resolve_profile_filename(file.unwrap())?;
+                HotkeyAction::Color {
+                    display: display.identity.clone(),
+                    file,
+                }
+            }
+            _ => return Err(format!("invalid hotkey action {action:?}")),
+        };
+        config.hotkeys.insert(key.into(), stored);
+        save_config(&config)?;
+        println!("Restart monitorctl-tray to apply hotkey changes.");
+        Ok(())
     })
 }
 
@@ -364,7 +441,9 @@ fn delete_hotkey(key: &str) -> Result<(), String> {
         if config.hotkeys.remove(key).is_none() {
             return Err(format!("hotkey {key:?} does not exist"));
         }
-        save_config(&config)
+        save_config(&config)?;
+        println!("Restart monitorctl-tray to apply hotkey changes.");
+        Ok(())
     })
 }
 
@@ -385,42 +464,6 @@ pub fn validate_hotkey(key: &str) -> Result<(), String> {
         .ok_or_else(|| format!("invalid hotkey {key:?}; use modifier+letter-or-digit"))
 }
 
-fn validate_hotkey_action(action: &str) -> Result<(), String> {
-    match action {
-        "restore" => Ok(()),
-        action
-            if action
-                .strip_prefix("profile:")
-                .is_some_and(|name| !name.is_empty()) =>
-        {
-            Ok(())
-        }
-        action
-            if action
-                .strip_prefix("toggle:")
-                .is_some_and(|display| !display.is_empty()) =>
-        {
-            Ok(())
-        }
-        _ => Err(format!("invalid hotkey action {action:?}")),
-    }
-}
-
-fn warn_missing_hotkey_target(config: &Config, action: &str) {
-    if let Some(name) = action.strip_prefix("profile:") {
-        if !config.profiles.contains_key(name) {
-            eprintln!("warning: profile {name:?} does not exist yet; hotkey saved");
-        }
-    } else if let Some(selector) = action.strip_prefix("toggle:") {
-        let available = discover_displays().and_then(|displays| {
-            resolve_display(&displays, &config.displays, selector).map(|_| ())
-        });
-        if available.is_err() {
-            eprintln!("warning: display {selector:?} is not available now; hotkey saved");
-        }
-    }
-}
-
 fn show_profile(name: &str) -> Result<(), String> {
     let config = load_config()?;
     let paths = config
@@ -433,7 +476,15 @@ fn show_profile(name: &str) -> Result<(), String> {
             .displays
             .iter()
             .find_map(|(alias, value)| (value == path).then_some(alias));
-        println!("  {}", alias.map_or(path.as_str(), String::as_str));
+        println!(
+            "  {}",
+            alias.map_or(
+                path.friendly_name
+                    .as_deref()
+                    .unwrap_or("Unavailable display"),
+                String::as_str,
+            )
+        );
     }
     Ok(())
 }
@@ -538,6 +589,10 @@ fn utf16_string(value: &[u16]) -> String {
     String::from_utf16_lossy(value.split(|unit| *unit == 0).next().unwrap_or_default())
 }
 
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
 fn usage() -> String {
     "invalid command; run `monitorctl --help`".into()
 }
@@ -546,19 +601,171 @@ struct DisplayConfig {
     paths: Vec<DISPLAYCONFIG_PATH_INFO>,
 }
 
-/// User-managed monitor mappings. Device paths are Windows identifiers, never indexes.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
-    pub displays: BTreeMap<String, String>,
+    pub displays: BTreeMap<String, DisplayIdentity>,
     #[serde(default)]
-    pub profiles: BTreeMap<String, Vec<String>>,
+    pub profiles: BTreeMap<String, Vec<DisplayIdentity>>,
     #[serde(default)]
-    pub hotkeys: BTreeMap<String, String>,
+    pub hotkeys: BTreeMap<String, HotkeyAction>,
     #[serde(default)]
     pub osd: OsdConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_active: Option<Vec<String>>,
+    pub previous_active: Option<Vec<DisplayIdentity>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EdidSerial {
+    manufacturer_id: u16,
+    product_code: u16,
+    serial: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DisplayIdentity {
+    #[serde(rename = "path")]
+    pub device_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friendly_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<EdidSerial>,
+}
+
+impl From<&str> for DisplayIdentity {
+    fn from(device_path: &str) -> Self {
+        Self {
+            device_path: device_path.into(),
+            friendly_name: None,
+            serial: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredDisplayIdentity {
+    Legacy(String),
+    Current(CurrentDisplayIdentity),
+}
+
+#[derive(Deserialize)]
+struct CurrentDisplayIdentity {
+    #[serde(rename = "path")]
+    device_path: String,
+    #[serde(default)]
+    friendly_name: Option<String>,
+    #[serde(default)]
+    serial: Option<EdidSerial>,
+}
+
+impl<'de> Deserialize<'de> for DisplayIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match StoredDisplayIdentity::deserialize(deserializer)? {
+            StoredDisplayIdentity::Legacy(device_path) => Ok(Self {
+                device_path,
+                friendly_name: None,
+                serial: None,
+            }),
+            StoredDisplayIdentity::Current(identity) => Ok(Self {
+                device_path: identity.device_path,
+                friendly_name: identity.friendly_name,
+                serial: identity.serial,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum HotkeyAction {
+    Restore,
+    Profile {
+        name: String,
+    },
+    Toggle {
+        display: DisplayIdentity,
+    },
+    Color {
+        display: DisplayIdentity,
+        file: String,
+    },
+    Legacy {
+        action: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredHotkeyAction {
+    Legacy(String),
+    Current(TaggedHotkeyAction),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum TaggedHotkeyAction {
+    Restore,
+    Profile {
+        name: String,
+    },
+    Toggle {
+        display: DisplayIdentity,
+    },
+    Color {
+        display: DisplayIdentity,
+        file: String,
+    },
+    Legacy {
+        action: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for HotkeyAction {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match StoredHotkeyAction::deserialize(deserializer)? {
+            StoredHotkeyAction::Legacy(action) => Self::Legacy { action },
+            StoredHotkeyAction::Current(TaggedHotkeyAction::Restore) => Self::Restore,
+            StoredHotkeyAction::Current(TaggedHotkeyAction::Profile { name }) => {
+                Self::Profile { name }
+            }
+            StoredHotkeyAction::Current(TaggedHotkeyAction::Toggle { display }) => {
+                Self::Toggle { display }
+            }
+            StoredHotkeyAction::Current(TaggedHotkeyAction::Color { display, file }) => {
+                Self::Color { display, file }
+            }
+            StoredHotkeyAction::Current(TaggedHotkeyAction::Legacy { action }) => {
+                Self::Legacy { action }
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for HotkeyAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Restore => write!(formatter, "restore"),
+            Self::Profile { name } => write!(formatter, "profile:{name}"),
+            Self::Toggle { display } => write!(
+                formatter,
+                "toggle:{}",
+                display
+                    .friendly_name
+                    .as_deref()
+                    .unwrap_or(&display.device_path)
+            ),
+            Self::Color { display, file } => write!(
+                formatter,
+                "color:{} {file}",
+                display
+                    .friendly_name
+                    .as_deref()
+                    .unwrap_or(&display.device_path)
+            ),
+            Self::Legacy { action } => write!(formatter, "{action}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -663,6 +870,7 @@ fn wide_path(path: &Path) -> Vec<u16> {
 pub struct Display {
     pub friendly_name: String,
     pub device_path: String,
+    pub identity: DisplayIdentity,
     pub active: bool,
 }
 
@@ -686,21 +894,22 @@ fn sort_displays(displays: &mut [Display]) {
 /// Resolve alias, then exact friendly name, then one case-insensitive name substring.
 pub fn resolve_display<'a>(
     displays: &'a [Display],
-    aliases: &BTreeMap<String, String>,
+    aliases: &BTreeMap<String, DisplayIdentity>,
     selector: &str,
 ) -> Result<&'a Display, String> {
-    if let Some(device_path) = aliases.get(selector) {
-        return displays
-            .iter()
-            .find(|display| display.device_path == *device_path)
-            .ok_or_else(|| format!("display alias {selector:?} is not present"));
+    if let Some(identity) = aliases.get(selector) {
+        return resolve_identity(displays, identity)
+            .map_err(|error| format!("display alias {selector:?}: {error}"));
     }
 
-    if let Some(display) = displays
+    let exact = displays
         .iter()
-        .find(|display| display.friendly_name == selector)
-    {
-        return Ok(display);
+        .filter(|display| display.friendly_name == selector)
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [display] => return Ok(display),
+        [] => {}
+        _ => return Err(format!("display selector {selector:?} is ambiguous")),
     }
 
     let selector = selector.to_lowercase();
@@ -724,13 +933,109 @@ pub fn resolve_display<'a>(
     Ok(display)
 }
 
+pub fn resolve_identity<'a>(
+    displays: &'a [Display],
+    identity: &DisplayIdentity,
+) -> Result<&'a Display, String> {
+    if let Some(serial) = &identity.serial {
+        return one_display(
+            displays
+                .iter()
+                .filter(|display| display.identity.serial.as_ref() == Some(serial)),
+            "serial",
+        );
+    }
+    if let Some(display) = displays
+        .iter()
+        .find(|display| display.device_path == identity.device_path)
+    {
+        return Ok(display);
+    }
+    if let Some(name) = identity.friendly_name.as_deref() {
+        return one_display(
+            displays
+                .iter()
+                .filter(|display| display.friendly_name == name),
+            "friendly name",
+        );
+    }
+    Err("display is not present".into())
+}
+
+fn one_display<'a>(
+    mut displays: impl Iterator<Item = &'a Display>,
+    identity: &str,
+) -> Result<&'a Display, String> {
+    let Some(display) = displays.next() else {
+        return Err(format!("display {identity} is not present"));
+    };
+    if displays.next().is_some() {
+        return Err(format!("display {identity} is ambiguous"));
+    }
+    Ok(display)
+}
+
 fn display_from_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<Display, String> {
     let target = target_name(path)?;
+    let device_path = utf16_string(&target.monitorDevicePath);
+    let friendly_name = utf16_string(&target.monitorFriendlyDeviceName);
     Ok(Display {
-        friendly_name: utf16_string(&target.monitorFriendlyDeviceName),
-        device_path: utf16_string(&target.monitorDevicePath),
+        identity: DisplayIdentity {
+            device_path: device_path.clone(),
+            friendly_name: (!friendly_name.is_empty()).then_some(friendly_name.clone()),
+            serial: display_serial(&device_path).map(|serial| EdidSerial {
+                manufacturer_id: target.edidManufactureId,
+                product_code: target.edidProductCodeId,
+                serial,
+            }),
+        },
+        friendly_name,
+        device_path,
         active: path.flags & 1 != 0,
     })
+}
+
+fn display_serial(device_path: &str) -> Option<u32> {
+    let monitor = device_path.strip_prefix(r"\\?\")?.split("#{").next()?;
+    let subkey = format!(
+        r"SYSTEM\CurrentControlSet\Enum\{}\Device Parameters",
+        monitor.replace('#', "\\")
+    );
+    let subkey = wide(&subkey);
+    let value = wide("EDID");
+    let mut size = 0;
+    if unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            None,
+            Some(&mut size),
+        )
+    } != ERROR_SUCCESS
+    {
+        return None;
+    }
+    let mut edid = vec![0; size as usize];
+    if unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(edid.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    } != ERROR_SUCCESS
+    {
+        return None;
+    }
+    edid.get(12..16)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+        .filter(|serial| *serial != 0 && *serial != u32::MAX)
 }
 
 pub fn enable_display(selector: &str) -> Result<(), String> {
@@ -767,6 +1072,20 @@ pub fn toggle_display_path(device_path: &str) -> Result<(), String> {
             .find(|display| display.device_path == device_path)
             .ok_or_else(|| format!("display path is not available: {device_path}"))?;
         change_display_path(&mut config, &displays, device_path, !display.active)
+    })
+}
+
+pub fn toggle_display_identity(identity: &DisplayIdentity) -> Result<(), String> {
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        let displays = discover_displays()?;
+        let display = resolve_identity(&displays, identity)?;
+        change_display_path(
+            &mut config,
+            &displays,
+            &display.device_path,
+            !display.active,
+        )
     })
 }
 
@@ -809,14 +1128,15 @@ pub fn create_profile(name: &str, selectors: &[String]) -> Result<(), String> {
     with_monitorctl_lock(|| {
         let mut config = load_config()?;
         let displays = discover_displays()?;
-        let mut paths = BTreeSet::new();
+        refresh_config_identities(&mut config, &displays);
+        let mut selected = BTreeMap::new();
         for selector in selectors {
             let display = resolve_display(&displays, &config.displays, selector)?;
-            paths.insert(display.device_path.clone());
+            selected.insert(display.device_path.clone(), display.identity.clone());
         }
         config
             .profiles
-            .insert(name.into(), paths.into_iter().collect());
+            .insert(name.into(), selected.into_values().collect());
         save_config(&config)
     })
 }
@@ -828,7 +1148,13 @@ pub fn save_profile(name: &str) -> Result<(), String> {
 
     with_monitorctl_lock(|| {
         let mut config = load_config()?;
-        let active = active_paths(&discover_displays()?);
+        let displays = discover_displays()?;
+        refresh_config_identities(&mut config, &displays);
+        let active = displays
+            .into_iter()
+            .filter(|display| display.active)
+            .map(|display| display.identity)
+            .collect::<Vec<_>>();
         if active.is_empty() {
             return Err("no active displays to save".into());
         }
@@ -852,30 +1178,16 @@ pub fn delete_profile(name: &str) -> Result<(), String> {
 pub fn apply_profile(name: &str) -> Result<(), String> {
     with_monitorctl_lock(|| {
         let mut config = load_config()?;
+        let displays = discover_displays()?;
+        refresh_config_identities(&mut config, &displays);
         let profile = config
             .profiles
             .get(name)
             .cloned()
             .ok_or_else(|| format!("profile {name:?} does not exist"))?;
-        let displays = discover_displays()?;
-        let desired = profile.iter().cloned().collect::<BTreeSet<_>>();
+        let desired = resolve_identities(&displays, &profile)?;
         if desired.is_empty() {
             return Err(format!("profile {name:?} has no displays"));
-        }
-        let present = displays
-            .iter()
-            .map(|display| display.device_path.as_str())
-            .collect::<BTreeSet<_>>();
-        let missing = desired
-            .iter()
-            .filter(|path| !present.contains(path.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "profile {name:?} requires unavailable displays: {}",
-                missing.join(", ")
-            ));
         }
         apply_active_set(&mut config, &displays, &desired)
     })
@@ -884,22 +1196,14 @@ pub fn apply_profile(name: &str) -> Result<(), String> {
 pub fn restore_previous_active_set() -> Result<(), String> {
     with_monitorctl_lock(|| {
         let mut config = load_config()?;
-        let desired = config
+        let displays = discover_displays()?;
+        refresh_config_identities(&mut config, &displays);
+        let identities = config
             .previous_active
             .clone()
-            .ok_or("no previous active-display set saved")?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let displays = discover_displays()?;
-        let present = displays
-            .iter()
-            .map(|display| display.device_path.as_str())
-            .collect::<BTreeSet<_>>();
-        if let Some(missing) = desired.iter().find(|path| !present.contains(path.as_str())) {
-            return Err(format!(
-                "previous active-display set requires unavailable display: {missing}"
-            ));
-        }
+            .ok_or("no previous active-display set saved")?;
+        let desired = resolve_identities(&displays, &identities)
+            .map_err(|error| format!("previous active-display set: {error}"))?;
         apply_active_set(&mut config, &displays, &desired)
     })
 }
@@ -910,6 +1214,31 @@ fn active_paths(displays: &[Display]) -> BTreeSet<String> {
         .filter(|display| display.active)
         .map(|display| display.device_path.clone())
         .collect()
+}
+
+pub fn resolve_identities(
+    displays: &[Display],
+    identities: &[DisplayIdentity],
+) -> Result<BTreeSet<String>, String> {
+    identities
+        .iter()
+        .map(|identity| {
+            resolve_identity(displays, identity).map(|display| display.device_path.clone())
+        })
+        .collect()
+}
+
+fn refresh_config_identities(config: &mut Config, displays: &[Display]) {
+    for identity in config
+        .displays
+        .values_mut()
+        .chain(config.profiles.values_mut().flatten())
+        .chain(config.previous_active.iter_mut().flatten())
+    {
+        if let Ok(display) = resolve_identity(displays, identity) {
+            *identity = display.identity.clone();
+        }
+    }
 }
 
 fn apply_active_set(
@@ -947,7 +1276,13 @@ fn apply_active_set(
     };
 
     let old_previous_active = config.previous_active.clone();
-    config.previous_active = Some(previous_active.into_iter().collect());
+    config.previous_active = Some(
+        displays
+            .iter()
+            .filter(|display| previous_active.contains(&display.device_path))
+            .map(|display| display.identity.clone())
+            .collect(),
+    );
     save_config(config)?;
     if let Err(error) = set_display_config(
         &paths,
@@ -1033,6 +1368,11 @@ mod tests {
         Display {
             friendly_name: name.into(),
             device_path: path.into(),
+            identity: DisplayIdentity {
+                device_path: path.into(),
+                friendly_name: Some(name.into()),
+                serial: None,
+            },
             active: true,
         }
     }
@@ -1056,6 +1396,58 @@ mod tests {
     }
 
     #[test]
+    fn resolves_serial_identity_after_path_changes() {
+        let mut display = display("Gigabyte M32Q", "new-path");
+        display.identity.serial = Some(EdidSerial {
+            manufacturer_id: 1,
+            product_code: 2,
+            serial: 3,
+        });
+        let identity = DisplayIdentity {
+            device_path: "old-path".into(),
+            friendly_name: Some("Gigabyte M32Q".into()),
+            serial: display.identity.serial.clone(),
+        };
+        assert_eq!(
+            resolve_identity(&[display], &identity).unwrap().device_path,
+            "new-path"
+        );
+    }
+
+    #[test]
+    fn resolves_unique_friendly_name_after_path_changes() {
+        let display = display("Laptop panel", "new-path");
+        let identity = DisplayIdentity {
+            device_path: "old-path".into(),
+            friendly_name: Some("Laptop panel".into()),
+            serial: None,
+        };
+        assert_eq!(
+            resolve_identity(&[display], &identity).unwrap().device_path,
+            "new-path"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_friendly_name_fallback() {
+        let identity = DisplayIdentity {
+            device_path: "old-path".into(),
+            friendly_name: Some("M32Q".into()),
+            serial: None,
+        };
+        assert!(
+            resolve_identity(&[display("M32Q", "one"), display("M32Q", "two")], &identity).is_err()
+        );
+    }
+
+    #[test]
+    fn reads_legacy_path_identity() {
+        let config = Config::from_toml("[displays]\ndesk = \"old-path\"").unwrap();
+        assert_eq!(config.displays["desk"].device_path, "old-path");
+        assert_eq!(config.displays["desk"].serial, None);
+    }
+
+    #[test]
     fn lists_displays_by_friendly_name() {
         let mut displays = [display("Gigabyte", "second"), display("Dell", "first")];
         sort_displays(&mut displays);
@@ -1073,10 +1465,16 @@ mod tests {
         config.displays.insert("desk".into(), "path-1".into());
         let displays = [display("Dell 27", "path-1"), display("LG 24", "path-2")];
 
-        assert_eq!(profile_display_name(&config, &displays, "path-1"), "desk");
-        assert_eq!(profile_display_name(&config, &displays, "path-2"), "LG 24");
         assert_eq!(
-            profile_display_name(&config, &displays, "missing"),
+            profile_display_name(&config, &displays, &DisplayIdentity::from("path-1")),
+            "desk"
+        );
+        assert_eq!(
+            profile_display_name(&config, &displays, &DisplayIdentity::from("path-2")),
+            "LG 24"
+        );
+        assert_eq!(
+            profile_display_name(&config, &displays, &DisplayIdentity::from("missing")),
             "Unavailable display"
         );
     }
@@ -1096,7 +1494,7 @@ mod tests {
     fn help_covers_profile_workflow() {
         assert!(help().contains("monitorctl profile save work"));
         assert!(profile_help().contains("create <name>"));
-        assert!(hotkey_help().contains("set <key> <action>"));
+        assert!(hotkey_help().contains("color:<monitor> <file>"));
         assert!(osd_help().contains("opacity"));
         assert!(color_help().contains("import <path>"));
     }

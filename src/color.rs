@@ -233,6 +233,14 @@ pub fn set_path(device_path: &str, file: &str) -> Result<(), String> {
     with_monitorctl_lock(|| set_for_path(device_path, file))
 }
 
+pub fn set_identity(identity: &crate::DisplayIdentity, file: &str) -> Result<(), String> {
+    with_monitorctl_lock(|| {
+        let displays = discover_displays()?;
+        let display = crate::resolve_identity(&displays, identity)?;
+        set_for_path(&display.device_path, file)
+    })
+}
+
 pub fn safe_profiles_for_path(device_path: &str) -> Result<Vec<String>, String> {
     let channel = color_target(device_path)?.channel;
     Ok(installed_profiles()?
@@ -240,6 +248,12 @@ pub fn safe_profiles_for_path(device_path: &str) -> Result<Vec<String>, String> 
         .filter(|(_, path)| profile_bytes(path).is_ok_and(|(_, detected)| detected == channel))
         .map(|(file, _)| file)
         .collect())
+}
+
+pub fn resolve_profile_filename(selector: &str) -> Result<String, String> {
+    let (file, path) = resolve_installed_file(selector)?;
+    profile_bytes(&path)?;
+    Ok(file)
 }
 
 fn set_for_path(device_path: &str, selector: &str) -> Result<(), String> {
