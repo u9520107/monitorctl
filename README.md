@@ -28,7 +28,7 @@ cargo run
 ```
 
 `list` is read-only. It prints Windows-visible monitors, friendly names,
-aliases, active state, and device paths.
+identity, active state, and device paths.
 
 ## CLI
 
@@ -124,41 +124,22 @@ or non-desktop sessions cannot call `SetDisplayConfig`.
 ## Monitor selection
 
 Numeric indexes are Phase 1 probe behavior only; Windows does not guarantee
-their order. Phase 2 commands resolve monitors in this order:
+their order. Commands resolve monitors in this order:
 
-1. exact user alias;
-2. exact friendly monitor name; then
-3. case-insensitive unique substring of friendly monitor name.
+1. exact friendly monitor name; then
+2. case-insensitive unique substring of friendly monitor name.
 
 Ambiguous partial names fail with matching monitor names. Monitorctl stores
-the exact Windows monitor device path behind each alias.
+durable monitor identity behind saved profiles and hotkeys.
 
-Monitorctl stores aliases, profiles, hotkeys, and the previous active set in:
+Monitorctl stores profiles, hotkeys, and the previous active set in:
 
 ```text
 %LOCALAPPDATA%\monitorctl\monitorctl.toml
 ```
 
-Create file to map aliases to monitor identity printed by `list`:
-
-```toml
-[displays.desk]
-path = "\\\\?\\DISPLAY#GBT3203#..."
-friendly_name = "Gigabyte M32Q"
-
-[displays.desk.serial]
-manufacturer_id = 21532
-product_code = 12803
-serial = 2461
-
-[hotkeys]
-"ctrl+alt+w" = "profile:work"
-
-[osd]
-opacity = 0.85
-```
-
-Profiles and aliases store monitor identity, never display indexes or layout.
+Use CLI commands to manage this file; do not add hotkeys manually. Profiles
+store monitor identity, never display indexes or layout.
 When EDID supplies a nonzero serial, Monitorctl matches manufacturer, product,
 and serial across port or topology changes. Otherwise it prefers saved Windows
 path, then uses an exact friendly-name match only when unique. Ambiguous
@@ -200,21 +181,11 @@ association for monitor's active color channel.
 ## Tray utility
 
 `monitorctl-tray` is a tray-only utility for Windows-visible monitors,
-profiles, restore, and configured global hotkeys. It uses a display alias as
-its menu label when configured; otherwise it uses the friendly name.
+profiles, restore, configured global hotkeys, and color-profile selection.
 Run it with:
 
 ```powershell
 cargo run --bin monitorctl-tray
-```
-
-Hotkeys map `ctrl`, `alt`, `shift`, or `win` plus one letter/digit to actions:
-
-```toml
-[hotkeys]
-"ctrl+alt+w" = "profile:work"
-"ctrl+alt+d" = "toggle:desk"
-"ctrl+alt+r" = "restore"
 ```
 
 Tray menu rebuilds on opening, so it reflects current Windows display state.

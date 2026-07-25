@@ -165,7 +165,7 @@ orientation, primary display, and extend/duplicate mode.\n\
 Usage: monitorctl <command>\n\
 \n\
 Commands:\n\
-  list                         List displays, aliases, paths, and active state\n\
+  list                         List displays, identities, paths, and active state\n\
   enable <display>             Include one display in desktop\n\
   disable <display>            Remove one display; refuses last active display\n\
   toggle <display>             Enable inactive display or disable active display\n\
@@ -176,9 +176,8 @@ Commands:\n\
   color <command>              Manage per-monitor ICC profiles\n\
   help, --help, -h             Show this help\n\
 \n\
-Display selectors: exact alias, exact friendly name, then unique\n\
-case-insensitive friendly-name substring. Ambiguous selectors fail.\n\
-Aliases are configured in %LOCALAPPDATA%\\monitorctl\\monitorctl.toml.\n\
+Display selectors: exact friendly name, then unique case-insensitive\n\
+friendly-name substring. Ambiguous selectors fail.\n\
 \n\
 Profile workflow:\n\
   monitorctl profile save work\n\
@@ -201,7 +200,8 @@ Commands:\n\
 \n\
 Profiles remain separate from active-display profiles. `set` accepts an exact\n\
 filename or unique case-insensitive filename substring. It requires a normal\n\
-profile for SDR or an advanced profile for Windows advanced color.\n"
+profile for SDR or an advanced profile for Windows advanced color. Monitor\n\
+selectors use exact or unique case-insensitive friendly-name substring.\n"
 }
 
 fn profile_help() -> &'static str {
