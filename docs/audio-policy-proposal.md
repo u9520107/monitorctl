@@ -1,0 +1,595 @@
+# Audio policy proposal
+
+Status: discussion draft
+Branch: `audio-policy-proposal`
+Created: 2026-08-27
+Updated: 2026-09-05
+
+## Executive summary
+
+Extending `monitorctl` with audio policy is a good fit for this personal
+Windows utility. The problem is narrow, the existing Rust/Windows shape fits,
+and a second repository or workspace would add no value now.
+
+One hard risk controls the plan: Windows publicly documents audio endpoint
+enumeration, default queries, metadata, and event notifications. It does not
+document a user-mode API for setting the system default endpoint. The practical
+setter is `IPolicyConfig::SetDefaultEndpoint`, an undocumented COM interface.
+That ABI must be isolated, manually tested, and treated as optional risk.
+
+Recommended direction:
+
+1. Keep this repository and the `monitorctl` name.
+2. Add an isolated `audio` module and optional TOML audio section.
+3. Build a read-only API spike first.
+4. Add explicit one-shot commands before any background watcher.
+5. Add an event-driven watcher only after the setter works reliably on the target
+   Windows 11 system.
+6. Defer endpoint enable/disable and audio-inclusive profiles.
+
+## Latest behavioral model
+
+The intended policy is an adaptive ordered priority list plus an optional
+suppression rule:
+
+```text
+priority = [focusrite, realtek, nvidiahd]
+suppress_nvidia = true
+```
+
+Behavior:
+
+- The same user-facing priority list applies to render and capture where a
+  matching endpoint exists. Windows flow remains separate internally because
+  NVIDIA normally has no capture endpoint.
+- With suppression disabled, Windows may select newly added devices normally;
+  monitorctl does not fight that behavior.
+- With suppression enabled, NVIDIA-like endpoints are treated as lowest
+  priority for automatic policy without being disabled.
+- If Windows selects a suppressed NVIDIA endpoint after driver recreation, the
+  watcher restores the highest-priority available non-suppressed endpoint.
+- If Windows selects a newly connected, non-suppressed endpoint, treat that as
+  intentional and add it to the top of the learned priority list. Example:
+  `[focusrite, realtek]` becomes `[dragonfly, focusrite, realtek]`.
+- If the newly connected endpoint is suppressed NVIDIA, do not learn/promote it;
+  restore the highest-priority available non-suppressed endpoint instead.
+- If a user later selects another endpoint, the list keeps the resulting order;
+  NVIDIA suppression still applies as an automatic overlay.
+- If no non-suppressed priority endpoint is available, leave the current
+  default unchanged and report the condition.
+- Suppression does not hide, uninstall, or mutate the Windows device. Explicit
+  disable/enable remains a separate future feature.
+
+When an endpoint disappears, remove it from the active list and delete its
+learned priority entry. If it later returns and Windows selects it, learn it
+again at the top as a new device.
+
+Suppression is an automatic-policy overlay, not a permanent prohibition. This
+keeps intentional NVIDIA selection possible without making the normal Windows
+device-switching behavior noisy.
+
+## Problem and desired outcome
+
+HDMI/DisplayPort monitors exposed through NVIDIA also expose render audio
+endpoints. Driver installation can recreate or re-enable them, after which
+Windows may choose one as default output.
+
+Desired policy:
+
+- Prefer outputs in explicit priority order, such as Focusrite 16i16, then
+  built-in Realtek.
+- Move away from NVIDIA monitor audio when policy enforcement runs.
+- Recover after endpoint recreation or default-device changes.
+- Never change monitor layout or display active state.
+- Never choose an arbitrary audio endpoint when no safe priority endpoint is
+  available.
+
+## Scope
+
+### In scope
+
+- Windows render- and capture-endpoint enumeration.
+- Current default render/capture endpoint by role.
+- Endpoint identity, metadata, and aliases.
+- Ordered audio-priority policy.
+- Explicit one-shot default selection.
+- Explicit one-shot policy enforcement.
+- Optional event-driven audio watcher.
+- Later, audio state in named profiles.
+
+### Out of scope for v1
+
+- Per-application or per-stream routing.
+- Volume, mute, sample rate, channel layout, or exclusive mode.
+- Monitor layout, resolution, scaling, refresh rate, orientation, or primary
+  display changes.
+- Automatic monitor profile switching.
+- Automatic endpoint enable/disable.
+- NVIDIA installer integration.
+- Service, scheduled task, dedicated settings window, or new repository.
+
+## Evaluation
+
+### Repository fit
+
+Current project has one Rust package and two binaries:
+
+- `monitorctl`: explicit CLI operations.
+- `monitorctl-tray`: menu and global hotkeys.
+
+Core logic is in `src/lib.rs`; config is TOML at
+`%LOCALAPPDATA%\\monitorctl\\monitorctl.toml`; Windows APIs use the `windows`
+crate. Audio should follow this shape:
+
+- Add `src/audio.rs` for discovery, identity, policy matching, default-role
+  queries, and the isolated setter boundary.
+- Extend `Config` with an optional audio section; old config remains valid.
+- Keep CLI dispatch in `src/lib.rs` initially; no command-parser dependency.
+- Add tray integration only after one-shot audio behavior works.
+- Do not hide audio repair inside monitor menu rebuilds.
+
+No new dependency is needed for the first implementation. Enable only the
+smallest `windows` features needed for `Win32_Media_Audio`, COM, property
+stores, and notification callbacks.
+
+### Windows API decision matrix
+
+| Need | API | Status | Proposal |
+| --- | --- | --- | --- |
+| Enumerate | `IMMDeviceEnumerator::EnumAudioEndpoints` | Documented | Active render/capture endpoints; all states for diagnostics. |
+| ID | `IMMDevice::GetId` | Documented | Store as current endpoint identity component. |
+| State | `IMMDevice::GetState` | Documented | Show active/disabled/not-present/unplugged; only active candidates. |
+| Metadata | `OpenPropertyStore`, `IPropertyStore`, `PKEY_Device_FriendlyName`, `PKEY_Device_DeviceDesc`, `PKEY_Device_InstanceId`, `PKEY_Device_ContainerId` | Documented | Read only; use for display and cautious matching of explicit aliases. |
+| Defaults | `GetDefaultAudioEndpoint` | Documented | Query render/capture defaults for each selected role. |
+| Watch | `IMMNotificationClient` plus registration | Documented | Receive add/remove/state/property/default-role events. |
+| Set default | `IPolicyConfig::SetDefaultEndpoint` via `CPolicyConfigClient` | Undocumented | One tiny adapter; manual-test on Windows 11. |
+| Hard block | `PKEY_AudioDevice_NeverSetAsDefaultEndpoint` | Documented for driver setup, not app policy | Defer; poor fit for per-user v1. |
+| Enable/disable | Device/control-panel mechanisms | Unsafe v1 | Defer. |
+
+Official docs say notification callbacks must be nonblocking and must avoid
+registration/unregistration and final COM releases inside callbacks. Callbacks
+must only enqueue a signal; enumeration and enforcement happen elsewhere.
+
+The official `PKEY_AudioDevice_NeverSetAsDefaultEndpoint` documentation is
+important but limited: the property must be paired with
+`PKEY_AudioEndpoint_Association` in the same endpoint subkey, and it blocks
+both automatic and user selection. That describes a driver/endpoint setup
+contract, not a clean user-level application API. Driver recreation may also
+recreate the endpoint property.
+
+### Default-correction API families
+
+There are several things commonly called an audio “API,” but they solve
+different problems:
+
+| Family | What it does | Fit |
+| --- | --- | --- |
+| MMDevice API | Enumerates endpoints, reads state/properties, reads current defaults, and receives notifications. | Supported and required for discovery/watch. It does not provide the normal user-level global default setter. |
+| `IPolicyConfigVista::SetDefaultEndpoint` | Sets a global endpoint for one `ERole` using an undocumented COM interface. | Practical legacy setter. Interface layout and COM identity must be declared manually. |
+| `IPolicyConfig::SetDefaultEndpoint` | Same global role-setting operation through a newer undocumented PolicyConfig interface variant. | Practical primary candidate on the target Windows 11 system; still unsupported and ABI-sensitive. |
+| `IAudioPolicyConfigFactory` | Persists per-application endpoint routing, including process/role-specific defaults. | Not the right operation: monitorctl wants the system-wide role defaults. Also undocumented. |
+| `PKEY_AudioDevice_NeverSetAsDefaultEndpoint` | Driver/INF property that prevents automatic and user selection. | Too strong and wrong scope: it is not a per-user runtime correction mechanism. |
+| Sound Settings/UI automation | Drives the user-facing settings surface. | Supported for the user, but fragile and unsuitable for silent event-driven repair. |
+
+PowerShell modules and small third-party utilities generally wrap one of the
+PolicyConfig interfaces; they do not provide a separate stable Windows setter.
+
+The minimal implementation should therefore be:
+
+1. Use documented MMDevice APIs for enumeration, defaults, and notifications.
+2. Validate the endpoint ID and role in Rust.
+3. Call one isolated `PolicyConfig` adapter for correction.
+4. Set Console, Multimedia, and Communications explicitly for the selected
+   flow, then re-query every role.
+5. Keep any Vista/modern interface fallback inside that adapter, never in the
+   watcher or policy code.
+
+Do not start by trying every interface variant. First test one target Windows
+11 build, record HRESULTs, and add a fallback only when an actual compatibility
+case exists.
+
+### Setter risk
+
+`IPolicyConfig` is the go/no-go item:
+
+- It is outside the documented MMDevice API.
+- Its COM class and interface are not ordinary generated `windows` bindings.
+- The vtable must be declared exactly for the target Windows variant.
+- A wrong method order can call the wrong function or fail unpredictably.
+- Community tools commonly set console, multimedia, and communications roles,
+  but this must be tested, not assumed.
+- Microsoft does not promise source compatibility for this interface.
+
+For this personal tool, proceed with the isolated adapter because automatic
+correction is valuable. If it fails on the target Windows 11 installation,
+stop at read-only diagnostics and offer Windows Sound Settings as supported
+fallback rather than spreading undocumented COM calls through the watcher.
+
+## Enabled endpoint, driver latency, and stability
+
+Research does not support a blanket claim that every enabled NVIDIA HDMI/DP
+endpoint makes Windows unstable or measurably slower. It does support a
+plausible, machine-specific failure mode:
+
+- An endpoint being present in Windows is not the same as an audio stream being
+  active. Windows tracks endpoint state separately from audio-session activity;
+  inactive sessions contain streams that are not currently running.
+- NVIDIA HD Audio and the Windows HD Audio bus participate in kernel driver
+  interrupt/DPC processing. A faulty or poorly behaving driver can therefore
+  contribute to audio glitches, stutter, or real-time-audio deadline misses.
+- Community reports describe improvements after disabling NVIDIA HD Audio, but
+  these are anecdotal and often also involve `nvlddmkm.sys`, `HDAudBus.sys`,
+  Nahimic/APO components, power settings, or a driver revision. They do not show
+  that an unused endpoint is the root cause on every system.
+- Disabling an endpoint in Sound settings may not remove every underlying bus or
+  GPU driver path. Device Manager/controller disablement and driver omission are
+  stronger, more invasive actions with different side effects.
+
+Microsoft describes DPC/ISR duration as a system-latency concern and recommends
+kernel tracing to measure it. Therefore monitorctl should not infer latency from
+endpoint presence or default status. If this becomes a requirement, add a
+separate opt-in experiment:
+
+1. Record a baseline with the exact NVIDIA, audio, and Focusrite driver versions.
+2. Run the same idle and real-time-audio workload with NVIDIA HD Audio enabled.
+3. Repeat with the exact endpoint/controller disablement recorded.
+4. Compare total and highest ISR/DPC time, named drivers, audio dropouts, and
+   system symptoms. Repeat after reboot and NVIDIA driver update.
+5. Re-enable the device and confirm HDMI/DP audio recovery.
+
+Use LatencyMon for a practical first pass, but treat ETW DPC/ISR tracing as the
+stronger diagnosis when results matter. A positive result would justify a
+separate future feature for disabling a known NVIDIA audio controller. It would
+not justify making ordinary default-policy enforcement disable devices.
+
+## Proposed policy model
+
+Use three concepts:
+
+- `priority`: ordered device selectors; first available match wins when
+  monitorctl explicitly applies policy or repairs a suppressed default.
+- `suppress_nvidia`: automatic exception that ranks NVIDIA-like endpoints below
+  normal priority devices without disabling them.
+- `roles`: default roles affected by set/enforce.
+
+Illustrative TOML:
+
+```toml
+[audio]
+roles = ["console", "multimedia", "communications"]
+priority = ["focusrite", "realtek", "nvidiahd"]
+suppress_nvidia = true
+
+[audio.devices.focusrite]
+id = "<endpoint-id>"
+friendly_name = "Speakers (Focusrite 16i16)"
+instance_id = "<instance-id>"
+container_id = "<container-id>"
+```
+
+Exact schema remains open. Persist no numeric endpoint index.
+
+### Selector resolution
+
+Recommended order:
+
+1. Exact configured alias.
+2. Exact endpoint ID.
+3. Exact friendly name.
+4. Unique case-insensitive friendly-name substring.
+5. Otherwise fail with matching candidates.
+
+For learned entries, a disappeared ID is removed rather than re-identified.
+Explicitly configured aliases may still use stored metadata, but only when the
+replacement is unique. Friendly-name-only matching is unsafe when several
+similar endpoints exist. Never silently accept ambiguity.
+
+Core Audio endpoint IDs are the current machine identity, not a guaranteed
+cross-driver identity. Store the ID plus friendly name, instance ID, and
+container ID where available. Validate replacement behavior against actual
+NVIDIA driver recreation before promising durable recovery.
+
+## Proposed commands
+
+Suggested surface:
+
+```text
+monitorctl audio list [--all]
+monitorctl audio default
+monitorctl audio set-default <selector>
+monitorctl audio enforce [--dry-run]
+monitorctl audio policy show
+monitorctl audio policy set-priority <selector,...>
+monitorctl audio policy suppress-nvidia <on|off>
+```
+
+Semantics:
+
+- `audio list`: read-only. Show endpoint ID, friendly name, flow, state,
+  role-default markers, alias, priority, and suppression classification.
+- `audio list --all`: include non-active states for diagnosis; never use them as
+  enforcement candidates.
+- `audio default`: read-only current default by configured role.
+- `audio set-default <selector>`: explicit user action through the isolated
+  PolicyConfig adapter. Set the selected active endpoint for configured flows
+  and roles. If the target is suppressed NVIDIA, create a temporary runtime
+  exception so it can be first while it remains the current default; clear that
+  exception when another endpoint is selected.
+- `audio enforce`: choose highest-priority available non-suppressed endpoint.
+  If no safe endpoint resolves uniquely, fail without changing anything.
+- `--dry-run`: show current defaults, candidate, and reason without setter call.
+- Policy-edit commands are optional. If they add too much surface, keep policy
+  edits in TOML for this personal tool.
+
+Separate `default` and `set-default` is safer than making one command both
+read and write based on optional arguments.
+
+## Decisions captured
+
+- Q1: use one priority policy for render and capture endpoints; apply it to each
+  flow independently where matching endpoints exist.
+- Q2: enforce all three roles for each flow: Console, Multimedia, and
+  Communications.
+- Q3: priority is ordered. Focusrite wins when available; Realtek is next
+  fallback; NVIDIA can remain in the list when not suppressed.
+- Q4: automatic enforcement is protective, not strict. A newly connected
+  non-suppressed output may become default intentionally; watcher repair targets
+  suppressed NVIDIA outputs or invalid/missing defaults.
+- Q5: explicit `audio enforce` is strict and selects the highest-priority
+   available non-suppressed output. Background watcher stays protective.
+- Q6: suppression protects automatic recovery only. Explicit `audio set-default`
+   remains allowed; selecting suppressed NVIDIA creates a temporary effective
+   top-priority exception, cleared when another endpoint is selected.
+- Q7: consider future explicit NVIDIA audio disable/enable only after measured
+  latency or stability benefit. Keep it separate from default enforcement and
+  automatic watcher behavior.
+- Q8: keep policy and future disable plumbing vendor-neutral, but initially
+  target only explicitly configured NVIDIA HD Audio functions. Add AMD/Intel
+  behavior only if real evidence requires it.
+- Q9: use hybrid NVIDIA detection. Monitorctl may identify and suggest
+  NVIDIA-like endpoints, but blocking requires explicit enablement.
+- Q10: expose simple policy changes through CLI. Keep TOML as storage and
+  advanced escape hatch; start GUI support through the existing tray rather
+  than adding a separate settings window.
+- Q11: keep GUI scope minimal. Use existing tray status/actions; defer a
+  dedicated settings window.
+- Q12: superseded by suppression model. Do not mutate Windows driver or
+  endpoint properties to impose an OS-wide hard block.
+- Q13: if no non-suppressed priority endpoint is available, leave current
+  default unchanged and warn/log. Never choose an arbitrary fallback.
+- Q14: priority changes should be available through simple CLI commands and
+  should apply the newly selected first device immediately.
+- Q15: newly added non-suppressed devices remain under normal Windows default
+   selection behavior.
+- Q16: priority is adaptive. A newly connected non-suppressed device that
+   Windows selects is learned at the top; a disappeared device leaves the
+   active list. NVIDIA suppression prevents NVIDIA devices from being learned
+   this way.
+
+## Enforcement algorithm
+
+1. Load config.
+2. Enumerate current endpoints and metadata.
+3. Query defaults for configured roles and flows.
+4. Resolve priority selectors against available endpoints.
+5. If a temporary explicit-tool override is active and still current, retain it.
+6. In watcher mode, if a newly added default is non-suppressed, learn it at the
+   top of the active priority list.
+7. In watcher mode, if default is suppressed NVIDIA or unavailable, choose the
+   highest-priority available non-suppressed endpoint.
+8. In explicit `audio enforce` mode, choose the highest-priority available
+   non-suppressed endpoint.
+9. If no safe endpoint resolves uniquely, fail closed with an actionable error.
+10. Set endpoint for each configured role and flow through the isolated adapter.
+11. Re-query and verify every requested role; report role-specific failure.
+
+Do not choose arbitrary non-suppressed fallback. A typo or temporary absence must
+not route sound somewhere surprising. Reuse the existing named mutex so audio
+and monitor config/state operations serialize.
+
+## Watcher design
+
+Do not build watcher first. Prove setter and one-shot enforcement first.
+
+Watcher behavior:
+
+- Own a COM apartment on its thread.
+- Create `MMDeviceEnumerator`, register one `IMMNotificationClient`.
+- Handle default, added, removed, state, and property events.
+- Do no blocking work inside callbacks.
+- Coalesce notification bursts from driver installation.
+- Re-enumerate and enforce outside callbacks.
+- Re-check defaults to suppress self-trigger loops.
+- Log old endpoint, new endpoint, reason, and role.
+- Correct silently by default. If configured, reuse the existing lower-center
+  OSD for a short correction message; do not add a second notification system.
+- Treat an explicit CLI or tray selection as a transient override. Record it in
+  shared local runtime state so the watcher can allow that one intentional
+  selection; clear it when another endpoint becomes default or the endpoint is
+  removed. Do not put this override in the durable policy list.
+- Unregister before releasing callback/enumerator.
+
+Use events, not continuous polling. Use bounded delayed retries after a driver
+change; never infinite rapid retry.
+
+### Process placement
+
+1. Existing `monitorctl-tray`: background watcher at login, matching the
+   current tray startup model.
+2. `monitorctl audio watch`: optional foreground diagnostic/development mode,
+   not required for normal use.
+3. New `monitorctl-audio` binary: defer; extra package/startup surface.
+
+Recommendation: build the watcher as shared core logic, host it in the existing
+tray, and keep CLI commands one-shot for manual control. Do not add a service or
+third binary until startup needs prove it.
+
+Audio watching starts automatically with the tray. `suppress_nvidia` controls
+whether it performs corrective audio changes; with suppression off, it can
+observe and learn devices without repairing ordinary Windows choices. It must
+never repair, restore, or maintain monitor state in the background. Monitor
+actions remain explicit CLI, tray-menu, or configured-hotkey actions.
+
+## Profiles later
+
+Do not expand current monitor profiles in the first audio slice. They currently
+contain only active display identities. Mixing audio in immediately creates
+rollback and partial-availability questions.
+
+After one-shot audio behavior is stable, profiles may store the ordered audio
+priority/suppression policy. They do not pin a concrete endpoint in v1.
+
+Application must resolve all requirements before any state change. Missing or
+ambiguous display/audio requirements must fail without partial application.
+
+## Safety
+
+- Endpoint IDs and hardware metadata stay local.
+- Do not write arbitrary endpoint property-store values in v1.
+- Do not edit driver registry state in v1.
+- Validate selectors and roles before setter calls.
+- Missing/ambiguous priority endpoints are no-op failures.
+- Never call undocumented setter from event callback.
+- Re-query after changes and surface verification failure.
+- Add dry-run before watcher enablement.
+- Keep audio-only behavior separate from monitor state.
+
+## Phases and acceptance criteria
+
+### Phase 0: read-only API spike
+
+Prove COM initialization, render/capture enumeration,
+name/ID/state/property extraction, default queries, and notifications. Test reboot,
+monitor unplug/replug,
+endpoint enable/disable, Windows Sound Settings default changes, and safe
+NVIDIA-driver lifecycle scenarios.
+
+### Phase 1: read-only CLI
+
+Add `audio list` and `audio default`. Add pure policy/selector tests over fake
+endpoint data. Exit when diagnostics identify which IDs/metadata change in the
+real failure scenario.
+
+### Phase 2: explicit setter
+
+Add isolated `IPolicyConfig` adapter, `audio set-default`, and dry-run then
+real `audio enforce`. No watcher. Acceptance: stable manual role behavior,
+post-write verification, no arbitrary fallback, no crashes.
+
+### Phase 3: watcher
+
+Add the tray-hosted watcher with coalescing, bounded retry, silent correction,
+optional OSD, and clean shutdown. Keep explicit `audio watch` as a foreground
+diagnostic/development mode. Acceptance: device/default changes repair without
+continuous polling or loops.
+
+### Phase 4: profiles/optional device disable
+
+Only if actual use proves need. Revisit audio profiles and the measured
+endpoint/controller disable experiment separately. Do not write the documented
+driver-oriented never-set-as-default property from monitorctl.
+
+### Verification
+
+Automated checks: selector precedence/ambiguity, ordered selection, suppression
+classification, missing endpoint fail-closed behavior, no-op without setter,
+role parsing, unique identity refresh, old-config deserialization, and watcher
+loop suppression where practical.
+
+Run `cargo fmt --check` and `cargo check`. Audio-changing behavior requires
+manual Windows testing, just as display-changing behavior does.
+
+## Open questions: answer these to lock the plan
+
+### Product behavior
+
+1. Resolved: use one priority policy for render and capture; apply it to each
+   flow independently where matching endpoints exist.
+2. Resolved: enforce Console, Multimedia, and Communications roles for each
+   flow.
+3. Resolved: priority is ordered. Focusrite wins when available; Realtek is
+   next fallback; NVIDIA may remain in the list when not suppressed.
+4. Resolved for automatic watcher: intervene only for suppressed/invalid
+   defaults; allow newly connected non-suppressed outputs to remain default.
+5. Resolved: explicit `set-default` remains allowed for suppressed targets;
+   suppression does not disable devices or reject explicit user choice.
+6. Resolved: no OS-wide hard block or driver/property mutation in this policy.
+7. Resolved: if no non-suppressed priority endpoint exists, leave current
+   default unchanged and warn/log. Never choose an arbitrary fallback.
+8. Resolved: explicit `audio enforce` selects the highest-priority available
+   non-suppressed output; background watcher stays protective.
+9. Resolved direction: changing priority should select the new first device
+   immediately; one-shot `set-default` remains available for temporary choice.
+
+### Identity/config
+
+10. What exact Focusrite, Realtek, and NVIDIA endpoint names appear on this
+    machine? A read-only probe will answer this.
+11. Resolved direction: simple policy changes should have CLI commands; TOML
+    remains storage and advanced escape hatch.
+12. Resolved: use existing tray status/actions; defer a dedicated settings
+    window.
+13. Resolved: use hybrid NVIDIA detection. Suggest NVIDIA-like endpoints, but
+    require explicit enablement before suppression.
+14. Persist metadata refresh automatically, or only after confirmation?
+    Recommendation: persist only unique replacements.
+15. Are there multiple similar endpoints that make substrings ambiguous? Which
+    aliases do you want?
+
+16. Resolved: delete a learned endpoint when it disappears. If it is later
+    reconnected and Windows selects it, learn it again at the top.
+
+### Setter/watcher
+
+17. Resolved: automatic correction is preferred. Use an isolated undocumented
+    PolicyConfig adapter, with read-only detection remaining independently
+    usable and Sound Settings as fallback if the adapter fails.
+18. Resolved: manually test correction after Windows/NVIDIA driver updates.
+19. Resolved: host the background watcher in the existing tray at login. Keep
+    `audio watch` as optional foreground diagnostic/development mode; CLI
+    commands remain primarily one-shot manual controls.
+20. Resolved: the tray starts audio watching automatically. No separate watcher
+    enable switch; `suppress_nvidia` controls whether corrective intervention is
+    active.
+21. Resolved: corrections are silent by default. Reuse the existing OSD as an
+    optional short message; do not add another notification mechanism.
+22. Resolved: debounce driver-update events, then retry up to three times over
+    roughly three seconds. Stop and report failure; never retry indefinitely.
+
+### Future scope
+
+23. Resolved direction: consider endpoint/controller disable/enable later as an
+    explicit opt-in feature, only after measurement shows a latency or stability
+    benefit. Initially target explicitly configured NVIDIA HD Audio functions;
+    keep mechanism vendor-neutral and separate from default policy.
+24. Resolved: profiles store the audio priority/suppression policy, not a
+    concrete endpoint ID. Endpoint pinning is not crucial for this use case;
+    audio devices are usually semantically unique, unlike identical monitors.
+    Revisit concrete endpoint pinning only if a real profile workflow requires
+    it.
+25. Resolved: keep the `monitorctl` name. No rename is needed for the audio
+     extension.
+
+## Proposed defaults if you want speed
+
+Assume Windows 11 desktop, render and capture, all three roles, adaptive priority
+list, explicit NVIDIA suppression, no auto-hard-block, fail-closed
+missing/ambiguous matches, read-only list/default commands, isolated
+undocumented setter, one-shot enforcement first, automatic tray watcher,
+optional foreground `audio watch`, no disable in v1, CLI policy commands,
+existing-tray GUI before any separate settings window, policy-only profiles,
+no endpoint pinning, no rename/workspace/service/dependency.
+
+## Sources
+
+- [Core Audio interfaces](https://learn.microsoft.com/en-us/windows/win32/coreaudio/core-audio-interfaces)
+- [GetDefaultAudioEndpoint](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-getdefaultaudioendpoint)
+- [Device properties](https://learn.microsoft.com/en-us/windows/win32/coreaudio/device-properties)
+- [Device events](https://learn.microsoft.com/en-us/windows/win32/coreaudio/device-events)
+- [IMMNotificationClient](https://learn.microsoft.com/en-gb/windows/win32/api/mmdeviceapi/nn-mmdeviceapi-immnotificationclient)
+- [Endpoint device states](https://learn.microsoft.com/en-us/windows/win32/coreaudio/device-state-xxx-constants)
+- [Device roles](https://learn.microsoft.com/en-us/windows/win32/coreaudio/device-roles)
+- [Endpoint ID strings](https://learn.microsoft.com/en-us/windows/win32/coreaudio/endpoint-id-strings)
+- [PKEY_AudioDevice_NeverSetAsDefaultEndpoint](https://github.com/MicrosoftDocs/windows-driver-docs/blob/staging/windows-driver-docs-pr/audio/pkey-audiodevice-neversetasdefaultendpoint.md)
+- [IMMDeviceEnumerator in windows 0.62.2](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Media/Audio/struct.IMMDeviceEnumerator.html)
+- [windows-rs issue on undocumented PolicyConfig](https://github.com/microsoft/windows-rs/issues/1355)
