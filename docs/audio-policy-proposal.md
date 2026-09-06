@@ -1,9 +1,10 @@
 # Audio policy proposal
 
-Status: discussion draft
+Status: execution plan
 Branch: `audio-policy-proposal`
 Created: 2026-08-27
 Updated: 2026-09-05
+Baseline commit: `4d63dda`
 
 ## Executive summary
 
@@ -17,6 +18,10 @@ document a user-mode API for setting the system default endpoint. The practical
 setter is `IPolicyConfig::SetDefaultEndpoint`, an undocumented COM interface.
 That ABI must be isolated, manually tested, and treated as optional risk.
 
+This document is the implementation plan. Work proceeds in small phases so
+each session leaves a usable, testable result. Do not begin the watcher until
+read-only discovery, policy selection, and the setter have each worked alone.
+
 Recommended direction:
 
 1. Keep this repository and the `monitorctl` name.
@@ -26,6 +31,42 @@ Recommended direction:
 5. Add an event-driven watcher only after the setter works reliably on the target
    Windows 11 system.
 6. Defer endpoint enable/disable and audio-inclusive profiles.
+
+## How to use this plan across sessions
+
+Each phase has a narrow scope, a deliverable, and an exit gate. A phase may take
+more than one session; do not start the next phase just because code exists.
+
+At the start of every session:
+
+1. Read this document's phase status and the current Git status.
+2. Reconfirm the phase exit gate before editing.
+3. Work only on the current phase unless a blocker requires a plan update.
+
+At the end of every session:
+
+1. Run the phase's automated checks.
+2. Record manual-test results, failures, and next action in the phase checklist.
+3. Leave unrelated work untouched and leave changes uncommitted unless a commit
+   is explicitly requested.
+
+Phase status:
+
+```text
+[x] Planning and API research
+[ ] Phase 0: repository and Windows baseline
+[ ] Phase 1: audio domain model and config
+[ ] Phase 2: read-only Core Audio discovery
+[ ] Phase 3: adaptive policy engine and CLI
+[ ] Phase 4: isolated default setter and one-shot enforcement
+[ ] Phase 5: tray-hosted event watcher
+[ ] Phase 6: tray controls, OSD, and startup behavior
+[ ] Phase 7: Windows/NVIDIA validation and hardening
+[ ] Phase 8: future profiles or endpoint disable experiment
+```
+
+The first implementation session should start at Phase 0, not by adding the
+watcher or changing the tray.
 
 ## Latest behavioral model
 
@@ -252,6 +293,11 @@ Use three concepts:
   normal priority devices without disabling them.
 - `roles`: default roles affected by set/enforce.
 
+The runtime also maintains adaptive state: learned non-suppressed devices are
+inserted at the top when Windows selects them, disappeared learned devices are
+deleted, and an explicit selection can create a transient override. None of
+that state disables devices or changes the user's suppression setting.
+
 Illustrative TOML:
 
 ```toml
@@ -454,40 +500,283 @@ ambiguous display/audio requirements must fail without partial application.
 - Add dry-run before watcher enablement.
 - Keep audio-only behavior separate from monitor state.
 
-## Phases and acceptance criteria
+## Execution plan
 
-### Phase 0: read-only API spike
+Implementation order:
 
-Prove COM initialization, render/capture enumeration,
-name/ID/state/property extraction, default queries, and notifications. Test reboot,
-monitor unplug/replug,
-endpoint enable/disable, Windows Sound Settings default changes, and safe
-NVIDIA-driver lifecycle scenarios.
+```text
+0 baseline -> 1 model -> 2 discovery -> 3 policy/CLI -> 4 setter
+  -> 5 watcher core -> 6 tray integration -> 7 validation
+  -> 8 future extensions
+```
 
-### Phase 1: read-only CLI
+Each phase below is a session-sized work package. Split a phase into multiple
+sessions if its exit gate is not met. Never skip a gate to start the watcher.
 
-Add `audio list` and `audio default`. Add pure policy/selector tests over fake
-endpoint data. Exit when diagnostics identify which IDs/metadata change in the
-real failure scenario.
+### Phase 0: repository and Windows baseline
 
-### Phase 2: explicit setter
+Goal: establish the smallest viable Windows API surface and capture the real
+machine behavior before designing matching rules around guessed names.
 
-Add isolated `IPolicyConfig` adapter, `audio set-default`, and dry-run then
-real `audio enforce`. No watcher. Acceptance: stable manual role behavior,
-post-write verification, no arbitrary fallback, no crashes.
+Work:
 
-### Phase 3: watcher
+- Confirm current branch, clean/dirty state, Rust toolchain, and existing tray
+  startup behavior.
+- Review `Cargo.toml`, `src/lib.rs`, `src/tray.rs`, `src/osd.rs`, and config
+  serialization boundaries.
+- Add only the required `windows` feature flags for COM, MMDevice, properties,
+  and notification interfaces.
+- Build a temporary read-only probe or test-only path. Do not add a setter,
+  watcher, tray behavior, or persistent audio state yet.
+- Record the actual Focusrite, Realtek, NVIDIA, and any other endpoint names,
+  flows, states, IDs, instance IDs, and container IDs.
+- Record which endpoint is default for Console, Multimedia, and Communications
+  on render and capture.
 
-Add the tray-hosted watcher with coalescing, bounded retry, silent correction,
-optional OSD, and clean shutdown. Keep explicit `audio watch` as a foreground
-diagnostic/development mode. Acceptance: device/default changes repair without
-continuous polling or loops.
+Deliverable: a compiling API baseline and a short machine-specific probe
+record in the session notes.
 
-### Phase 4: profiles/optional device disable
+Exit gate:
 
-Only if actual use proves need. Revisit audio profiles and the measured
-endpoint/controller disable experiment separately. Do not write the documented
-driver-oriented never-set-as-default property from monitorctl.
+- `cargo fmt --check` and `cargo check` pass.
+- Read-only enumeration and default queries work on the target Windows 11
+  machine.
+- The endpoint metadata needed for aliases and NVIDIA classification is known.
+- No Windows state was changed.
+
+### Phase 1: audio domain model and configuration
+
+Goal: make policy behavior deterministic and testable without Windows calls.
+
+Work:
+
+- Add the smallest shared audio model: flow, role, endpoint snapshot, selector,
+  suppression classification, priority list, and transient explicit override.
+- Add an optional `[audio]` TOML section with backward-compatible defaults:
+  roles, priority, and `suppress_nvidia`.
+- Keep learned priority entries in the existing local config/state boundary;
+  delete learned entries when their endpoint disappears.
+- Implement selector precedence: alias, exact endpoint ID, exact friendly name,
+  then unique case-insensitive friendly-name substring.
+- Implement ordered selection and the suppression overlay. Suppression must not
+  mutate the configured order or disable a device.
+- Implement the adaptive rules over fake endpoint data:
+  - newly selected non-suppressed endpoint moves to the top;
+  - newly selected suppressed NVIDIA endpoint is rejected for automatic policy;
+  - disappeared learned endpoint is removed;
+  - explicit NVIDIA selection creates a temporary override;
+  - selecting another endpoint clears that override.
+
+Deliverable: pure policy/config code with no COM dependency and focused tests.
+
+Exit gate:
+
+- Existing monitor config deserializes unchanged when `[audio]` is absent.
+- Tests cover ordering, ambiguity, suppression, add/remove, and override rules.
+- No test invokes a Windows setter or changes a device.
+
+### Phase 2: read-only Core Audio discovery and CLI
+
+Goal: expose the real endpoint state safely and make diagnostics useful before
+any corrective action exists.
+
+Work:
+
+- Implement COM initialization and MMDevice enumeration for render and capture.
+- Read active endpoints by default; support `--all` for disabled, unplugged,
+  and not-present diagnostics.
+- Extract friendly name, description, endpoint ID, instance ID, container ID,
+  flow, and state.
+- Query Console, Multimedia, and Communications defaults separately.
+- Add:
+  - `monitorctl audio list [--all]`
+  - `monitorctl audio default`
+  - `monitorctl audio policy show`
+- Show enough information to diagnose the NVIDIA recreation case without
+  exposing internal pointer/COM details.
+- Use the actual machine to check plug/unplug, Sound Settings changes, reboot,
+  and NVIDIA driver lifecycle behavior. Keep the probe read-only.
+
+Deliverable: reliable read-only CLI and a real endpoint inventory.
+
+Exit gate:
+
+- Every endpoint shown has a stable current ID and useful metadata.
+- Role/default output is correct for both flows.
+- Ambiguous selectors are reported with candidates, never guessed.
+- Manual diagnostics identify how NVIDIA IDs and metadata change after update.
+
+### Phase 3: adaptive policy engine and one-shot policy CLI
+
+Goal: persist the user's intent and learned device order without changing
+Windows defaults yet.
+
+Work:
+
+- Connect Phase 1 policy logic to real endpoint snapshots from Phase 2.
+- Persist the ordered list and suppression setting using the existing config
+  writer and mutex.
+- Add simple policy commands:
+  - `monitorctl audio policy set-priority <selector,...>`
+  - `monitorctl audio policy suppress-nvidia <on|off>`
+- Make priority changes immediately select the new first policy candidate in
+  the policy result, while keeping the actual default unchanged until Phase 4.
+- Learn a newly connected non-suppressed endpoint only when Windows has selected
+  it. Do not insert every merely enumerated endpoint.
+- Remove learned entries on endpoint removal. Keep explicit aliases separate
+  from learned entries.
+- Add `audio enforce --dry-run` to explain the candidate, suppression reason,
+  and no-op conditions without calling a setter.
+
+Deliverable: persisted, explainable policy decisions with no default mutation.
+
+Exit gate:
+
+- A Dragonfly-style endpoint moves to the top only after Windows selects it.
+- NVIDIA is not learned when suppression is enabled.
+- Missing/ambiguous/no-safe-candidate cases fail closed.
+- Dry-run output matches the pure policy tests.
+
+### Phase 4: isolated default setter and explicit enforcement
+
+Goal: prove safe correction manually before putting it behind events or tray
+startup.
+
+Work:
+
+- Add one isolated `PolicyConfig` adapter for the tested Windows 11 variant.
+- Keep all manually declared COM interfaces, CLSIDs/IIDs, HRESULT handling, and
+  unsafe code inside that adapter.
+- Validate that the target endpoint is active, belongs to the requested flow,
+  and resolves uniquely before calling the setter.
+- Implement role-specific setting for Console, Multimedia, and Communications.
+- Add:
+  - `monitorctl audio set-default <selector>`
+  - real `monitorctl audio enforce`
+- For explicit selection of suppressed NVIDIA, record the transient override so
+  the tray watcher will honor the intentional choice.
+- Re-query every role after setting and report partial role failure clearly.
+- Never change endpoint visibility, driver properties, or enable/disable state.
+
+Deliverable: manually usable correction with post-write verification.
+
+Exit gate:
+
+- Focusrite, Realtek, and NVIDIA can each be selected intentionally when active.
+- All configured roles are verified after a change.
+- `--dry-run` never invokes the setter.
+- No arbitrary fallback occurs when a configured candidate is absent.
+- Failures are contained within the adapter and do not crash the CLI.
+- Manual Windows testing passes after reboot and endpoint recreation.
+
+### Phase 5: event-driven watcher core
+
+Goal: react to endpoint/default changes without continuous polling or fighting
+normal Windows device selection.
+
+Work:
+
+- Implement `IMMNotificationClient` registration in a dedicated watcher thread
+  with its own COM apartment.
+- Have callbacks enqueue lightweight events only. Do enumeration, policy work,
+  persistence, and setting outside callbacks.
+- Handle endpoint added, removed, state, property, and default-role events.
+- Coalesce event bursts with a short debounce, then retry up to three times over
+  roughly three seconds while driver installation settles.
+- Apply the behavior matrix:
+  - suppression off: observe and learn normal Windows choices; do not repair;
+  - suppression on + suppressed NVIDIA default: restore best safe candidate;
+  - suppression on + new non-NVIDIA default: learn it and leave it selected;
+  - explicit tool override: honor it until another endpoint becomes default;
+  - endpoint removal: delete its learned entry and clear stale override state.
+- Re-check defaults after every correction to suppress self-trigger loops.
+- Log old endpoint, new endpoint, role, reason, retry, and failure.
+- Keep `monitorctl audio watch` as a foreground diagnostic harness for this
+  core, even though normal use will be tray-hosted.
+
+Deliverable: watcher core that can be exercised without changing tray startup.
+
+Exit gate:
+
+- NVIDIA driver recreation is corrected when suppression is enabled.
+- Newly connected normal devices remain under Windows control and are learned.
+- No continuous polling, callback blocking, infinite retries, or correction loop.
+- Clean watcher shutdown unregisters notifications and releases COM safely.
+
+### Phase 6: tray integration, OSD, and startup
+
+Goal: make the watcher part of normal monitorctl use without changing the
+existing monitor product boundary.
+
+Work:
+
+- Start the shared watcher automatically from `monitorctl-tray` at login,
+  matching existing tray startup behavior.
+- Do not add a watcher enable switch. `suppress_nvidia` controls corrective
+  intervention; suppression off still permits observation/learning.
+- Keep CLI commands one-shot for manual list, default, policy, enforce, and
+  set-default operations.
+- Add minimal tray status/actions only after the watcher is stable. Do not add
+  a settings window.
+- Keep corrections silent by default. If configured, reuse the existing OSD for
+  a short message; do not create a new notification system.
+- Share transient explicit-selection state between CLI and tray through local
+  runtime state, not the durable priority policy.
+- Ensure tray monitor menus, hotkeys, and OSD behavior remain unchanged when
+  audio discovery or correction fails.
+
+Deliverable: automatic tray-hosted audio policy with safe degradation.
+
+Exit gate:
+
+- Tray starts exactly one watcher and shuts it down cleanly.
+- Existing monitor behavior remains unchanged.
+- Audio failures are logged/visible through the existing mechanisms but do not
+  break the tray.
+- Manual CLI commands remain usable while the tray is running.
+
+### Phase 7: Windows/NVIDIA validation and hardening
+
+Goal: validate the real failure mode and remove operational surprises.
+
+Test matrix:
+
+- Clean boot with Focusrite and Realtek available.
+- NVIDIA endpoints present at boot, absent at boot, and recreated after a
+  driver update.
+- Suppression on and off.
+- Focusrite first, Realtek first, and no safe configured endpoint.
+- Dragonfly or another new non-suppressed device plugged in and selected by
+  Windows, then unplugged.
+- Manual Windows Sound Settings changes to every role.
+- Explicit CLI/tray selection of NVIDIA while suppression is enabled, followed
+  by selection of another endpoint.
+- Disabled, unplugged, not-present, duplicate-name, and ambiguous-selector
+  cases.
+- Reboot, tray restart, watcher restart, and concurrent CLI use.
+
+Acceptance:
+
+- Automatic correction occurs only for suppressed NVIDIA or invalid defaults.
+- Normal Windows switching remains normal for non-suppressed devices.
+- Learned order matches the documented adaptive rules.
+- No endpoint is disabled, hidden, uninstalled, or assigned arbitrary state.
+- All automated checks pass: `cargo fmt --check`, `cargo check`, and tests.
+- Manual results and any Windows-version limitations are recorded here before
+  calling v1 complete.
+
+### Phase 8: future extensions, only if justified
+
+Do not block v1 on these items:
+
+- Add policy-only audio state to monitor profiles.
+- Measure NVIDIA audio/controller DPC/ISR impact with the exact driver stack.
+- If measurements justify it, design a separate explicit enable/disable
+  experiment for configured NVIDIA HD Audio functions. Keep the internals
+  vendor-neutral and never make default correction disable devices.
+- Consider other vendors only when real evidence requires it.
+- Do not add a service, third binary, endpoint pinning, or rename unless actual
+  use creates a concrete need.
 
 ### Verification
 
@@ -499,7 +788,10 @@ loop suppression where practical.
 Run `cargo fmt --check` and `cargo check`. Audio-changing behavior requires
 manual Windows testing, just as display-changing behavior does.
 
-## Open questions: answer these to lock the plan
+## Remaining validation questions
+
+The product decisions are resolved. These questions require the real Windows
+machine or can be answered during implementation.
 
 ### Product behavior
 
