@@ -6,7 +6,7 @@ use windows::{
             PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName, PKEY_Device_Manufacturer,
             PKEY_DeviceInterface_FriendlyName,
         },
-        Foundation::PROPERTYKEY,
+        Foundation::{ERROR_NOT_FOUND, PROPERTYKEY},
         Media::Audio::{
             DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT,
             DEVICE_STATE_UNPLUGGED, DEVICE_STATEMASK_ALL, IMMDevice, IMMDeviceEnumerator,
@@ -176,20 +176,33 @@ fn snapshot(include_all: bool) -> Result<Vec<Endpoint>, String> {
 fn defaults() -> Result<Vec<(&'static str, Option<String>)>, String> {
     let _com = ComApartment::initialize()?;
     let enumerator = create_enumerator()?;
-    Ok([
+    [
         ("Console", eConsole),
         ("Multimedia", eMultimedia),
         ("Communications", eCommunications),
     ]
     .into_iter()
-    .map(|(name, role)| {
-        let id = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, role) }
-            .ok()
-            .and_then(|device| unsafe { device.GetId().ok() })
-            .map(|id| unsafe { take_pwstr(id) });
-        (name, id)
-    })
-    .collect())
+    .map(|(name, role)| Ok((name, default_for_role(&enumerator, name, role)?)))
+    .collect()
+}
+
+fn default_for_role(
+    enumerator: &IMMDeviceEnumerator,
+    role_name: &str,
+    role: windows::Win32::Media::Audio::ERole,
+) -> Result<Option<String>, String> {
+    let device = match unsafe { enumerator.GetDefaultAudioEndpoint(eRender, role) } {
+        Ok(device) => device,
+        Err(error) if is_no_default_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot query {role_name} default render endpoint: {error}"
+            ));
+        }
+    };
+    let id = unsafe { device.GetId() }
+        .map_err(|error| format!("cannot read {role_name} default endpoint ID: {error}"))?;
+    Ok(Some(unsafe { take_pwstr(id) }))
 }
 
 fn endpoint(device: &IMMDevice) -> Result<Endpoint, String> {
@@ -208,16 +221,20 @@ fn endpoint(device: &IMMDevice) -> Result<Endpoint, String> {
     let manufacturer = property_string(&store, &PKEY_Device_Manufacturer);
     let description = property_string(&store, &PKEY_Device_DeviceDesc);
     let evidence = [
-        friendly_name,
-        adapter_name.clone(),
-        manufacturer.clone(),
-        description,
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>();
-    let evidence_text = evidence.join(" | ");
+        ("friendly_name", friendly_name.as_deref()),
+        ("adapter", adapter_name.as_deref()),
+        ("manufacturer", manufacturer.as_deref()),
+        ("description", description.as_deref()),
+    ];
+    let evidence_text = evidence
+        .iter()
+        .filter_map(|(source, value)| {
+            value
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{source}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
     let classification = classify(&evidence);
     Ok(Endpoint {
         id,
@@ -243,18 +260,36 @@ fn property_string(store: &IPropertyStore, key: &PROPERTYKEY) -> Option<String> 
     (!value.is_empty()).then_some(value)
 }
 
-fn classify(values: &[String]) -> NvidiaClassification {
-    if values.is_empty() {
-        return NvidiaClassification::Unknown;
-    }
+fn classify(metadata: &[(&str, Option<&str>)]) -> NvidiaClassification {
+    let trusted_values = metadata
+        .iter()
+        .filter(|(source, _)| matches!(*source, "adapter" | "manufacturer"))
+        .filter_map(|(_, value)| *value);
+    let values = trusted_values.collect::<Vec<_>>();
     if values
         .iter()
         .any(|value| value.to_ascii_lowercase().contains("nvidia"))
     {
         NvidiaClassification::Nvidia
-    } else {
+    } else if values.iter().any(|value| !is_generic_metadata(value)) {
         NvidiaClassification::NonNvidia
+    } else {
+        NvidiaClassification::Unknown
     }
+}
+
+fn is_no_default_error(error: &windows::core::Error) -> bool {
+    error.code() == ERROR_NOT_FOUND.to_hresult()
+}
+
+fn is_generic_metadata(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "audio device"
+            | "high definition audio"
+            | "high definition audio device"
+            | "usb audio device"
+    )
 }
 
 unsafe fn take_pwstr(value: PWSTR) -> String {
@@ -274,18 +309,47 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NvidiaClassification, classify};
+    use super::{NvidiaClassification, classify, is_no_default_error};
+    use windows::core::{Error, HRESULT};
 
     #[test]
     fn classification_uses_metadata() {
         assert_eq!(
-            classify(&["Speakers".into(), "NVIDIA High Definition Audio".into()]),
+            classify(&[
+                ("friendly_name", Some("Speakers")),
+                ("adapter", Some("NVIDIA High Definition Audio"),)
+            ]),
             NvidiaClassification::Nvidia
         );
         assert_eq!(
-            classify(&["Focusrite USB".into()]),
+            classify(&[("adapter", Some("Focusrite USB"))]),
             NvidiaClassification::NonNvidia
         );
+        assert_eq!(
+            classify(&[("friendly_name", Some("HDMI"))]),
+            NvidiaClassification::Unknown
+        );
+        assert_eq!(
+            classify(&[("adapter", Some("High Definition Audio Device"))]),
+            NvidiaClassification::Unknown
+        );
+        assert_eq!(
+            classify(&[
+                ("adapter", Some("High Definition Audio Device")),
+                ("description", Some("Gigabyte M32Q")),
+            ]),
+            NvidiaClassification::Unknown
+        );
         assert_eq!(classify(&[]), NvidiaClassification::Unknown);
+    }
+
+    #[test]
+    fn only_no_default_is_treated_as_unavailable() {
+        assert!(is_no_default_error(&Error::from_hresult(
+            super::ERROR_NOT_FOUND.to_hresult()
+        )));
+        assert!(!is_no_default_error(&Error::from_hresult(HRESULT(
+            0x8000_4005_u32 as i32
+        ))));
     }
 }
