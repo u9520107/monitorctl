@@ -32,6 +32,7 @@ use windows::Win32::Devices::Display::{
     SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE, SET_DISPLAY_CONFIG_FLAGS, SetDisplayConfig,
 };
 
+pub mod audio;
 pub mod color;
 pub mod osd;
 
@@ -88,6 +89,7 @@ pub fn run_cli() -> Result<(), String> {
         [command, topic] if command == "help" && topic == "hotkey" => print_help(hotkey_help()),
         [command, topic] if command == "help" && topic == "osd" => print_help(osd_help()),
         [command, topic] if command == "help" && topic == "color" => print_help(color_help()),
+        [command, topic] if command == "help" && topic == "audio" => print_help(audio_help()),
         [topic, command]
             if topic == "profile" && matches!(command.as_str(), "--help" | "-h" | "help") =>
         {
@@ -107,6 +109,11 @@ pub fn run_cli() -> Result<(), String> {
             if topic == "color" && matches!(command.as_str(), "--help" | "-h" | "help") =>
         {
             print_help(color_help())
+        }
+        [topic, command]
+            if topic == "audio" && matches!(command.as_str(), "--help" | "-h" | "help") =>
+        {
+            print_help(audio_help())
         }
         [] => list(),
         [command] if command == "list" => list(),
@@ -147,6 +154,11 @@ pub fn run_cli() -> Result<(), String> {
         [command, action, monitor, file] if command == "color" && action == "set" => {
             color::set(monitor, file)
         }
+        [command, action] if command == "audio" && action == "list" => audio::list(false),
+        [command, action, flag] if command == "audio" && action == "list" && flag == "--all" => {
+            audio::list(true)
+        }
+        [command, action] if command == "audio" && action == "default" => audio::default(),
         _ => Err(usage()),
     }
 }
@@ -174,6 +186,7 @@ Commands:\n\
   hotkey <command>             Manage tray global-hotkey configuration\n\
   osd <command>                Show OSD or set its opacity\n\
   color <command>              Manage per-monitor ICC profiles\n\
+  audio <command>              Inspect Windows render audio endpoints\n\
   help, --help, -h             Show this help\n\
 \n\
 Display selectors: exact friendly name, then unique case-insensitive\n\
@@ -202,6 +215,15 @@ Profiles remain separate from active-display profiles. `set` accepts an exact\n\
 filename or unique case-insensitive filename substring. It requires a normal\n\
 profile for SDR or an advanced profile for Windows advanced color. Monitor\n\
 selectors use exact or unique case-insensitive friendly-name substring.\n"
+}
+
+fn audio_help() -> &'static str {
+    "\
+Usage: monitorctl audio <command>\n\
+\n\
+Commands:\n\
+  list [--all]                 List render endpoints and metadata\n\
+  default                      Show current render defaults by role\n"
 }
 
 fn profile_help() -> &'static str {

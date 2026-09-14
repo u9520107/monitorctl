@@ -344,8 +344,20 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
 
 ## Session record
 
-- 2026-09-13: revised proposal only. No audio implementation or manual Windows
-  testing performed. Next action: Phase 0.
+- 2026-09-13: Phase 0 implemented in `src/audio.rs`. Added read-only
+  `monitorctl audio list [--all]` and `monitorctl audio default`, using native
+  MMDevice APIs, COM, endpoint property stores, exact endpoint IDs, and
+  render-role queries. `cargo fmt --check`, `cargo check`, and focused tests
+  pass. Read-only Windows probe found one active endpoint: `Speakers (Focusrite
+  USB Audio)`, ID `{0.0.0.00000000}.{9f071129-29b9-41c0-be06-35e16d79f360}`;
+  Console, Multimedia, and Communications all use it. `--all` found NVIDIA
+  High Definition Audio and monitor endpoints as not-present, plus Realtek and
+  AudioQuest DragonFly as not-present; NVIDIA classification is evidenced by
+  endpoint and adapter metadata. No Windows audio state or config state changed.
+  Role scope remains Console and Multimedia for future quick selection and
+  correction; Communications remains observed only until later validation.
+  Phase 0 exit gate passed. Next action: Phase 1 isolated explicit setter,
+  pending explicit authorization for manual audio switching.
 - Record future sessions here with phase, files changed, checks, manual evidence,
   unresolved items, and the exact next action.
 
