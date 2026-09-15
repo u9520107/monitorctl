@@ -92,6 +92,13 @@ latency investigations, scheduled tasks, a service, and separate settings UI.
 Do not expand display behavior: arrangement and other display settings remain
 Windows-owned, and background monitor restoration remains prohibited.
 
+Possible later enhancement: add explicit `audio enable <endpoint>` and
+`audio disable <endpoint>` commands. This would require separate Windows device
+management APIs, exact endpoint identity validation, post-action state checks,
+and clear warnings because enabling or disabling an endpoint changes global
+Windows device availability. It remains outside the current audio selection and
+NVIDIA correction phases, with no automatic enable or disable behavior planned.
+
 ## Implementation defaults and remaining decisions
 
 These fill gaps left by the discussion. Record any adjustment here before coding
@@ -257,7 +264,7 @@ compilation alone. Do not start automatic correction before the setter gate pass
 ```text
 [x] Design review and live-inventory behavior agreed
 [x] Phase 0: read-only baseline
-[ ] Phase 1: explicit default setter
+[x] Phase 1: explicit default setter
 [ ] Phase 2: tray quick selection
 [ ] Phase 3: live list and suppression decision tests
 [ ] Phase 4: tray observation and automatic correction
@@ -370,6 +377,18 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
   selector tests. `cargo fmt --check`, `cargo check`, and `cargo test audio`
   pass. Manual switching remains pending explicit opt-in and Windows target
   validation; Phase 1 exit gate is not yet passed.
+- 2026-09-14: Manual Phase 1 test passed for active non-NVIDIA outputs after
+  Realtek was re-enabled. `audio set-default` switched from Focusrite to
+  `Speakers (Realtek(R) Audio)` and back; Console and Multimedia verified after
+  each write, Communications remained unchanged while Realtek was selected,
+  and Focusrite was restored as all-role default. NVIDIA endpoints remain
+  `not-present`, so NVIDIA-specific switching with suppression disabled remains
+  pending. Phase 1 gate stays open only for that target availability check.
+- 2026-09-14: NVIDIA endpoint became active after device re-enablement.
+  `audio set-default` switched to `Gigabyte M32Q (NVIDIA High Definition
+  Audio)` and verified Console and Multimedia, then restored Focusrite and
+  verified both roles again. Communications stayed on NVIDIA during the
+  Focusrite restore, confirming setter role scope. Phase 1 exit gate passed.
 - Record future sessions here with phase, files changed, checks, manual evidence,
   unresolved items, and the exact next action.
 

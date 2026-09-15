@@ -208,10 +208,10 @@ fn resolve_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Result<&'a
         _ => return Err(format!("audio selector {selector:?} is ambiguous")),
     }
 
-    let selector = selector.to_ascii_lowercase();
+    let selector = selector.to_lowercase();
     let matches = endpoints
         .iter()
-        .filter(|endpoint| endpoint.name.to_ascii_lowercase().contains(&selector))
+        .filter(|endpoint| endpoint.name.to_lowercase().contains(&selector))
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [endpoint] => Ok(endpoint),
@@ -541,5 +541,11 @@ mod tests {
             endpoint("id-2", "Desk Headset"),
         ];
         assert!(resolve_endpoint(&endpoints, "desk").is_err());
+    }
+
+    #[test]
+    fn resolves_unicode_case_insensitive_substrings() {
+        let endpoints = [endpoint("id-1", "Écran USB")];
+        assert_eq!(resolve_endpoint(&endpoints, "éCRAN").unwrap().id, "id-1");
     }
 }
