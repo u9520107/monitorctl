@@ -204,17 +204,18 @@ monitorctl osd opacity 0.85
 `osd show` stays open for two seconds, then exits. Tray success, error, and
 hotkey-conflict messages show for five seconds.
 
-### Audio baseline
+### Audio selection
 
-Inspect active render endpoints and current Windows defaults without changing
-audio state:
+Inspect active render endpoints and current Windows defaults:
 
 ```powershell
 monitorctl audio list
 monitorctl audio list --all
 monitorctl audio default
+monitorctl audio set-default "Speakers"
 ```
 
 `audio list --all` includes disabled, unplugged, and not-present endpoints for
-diagnostics. Audio selection and optional NVIDIA suppression are planned for
-later phases; this baseline has no setter or background watcher.
+diagnostics. `audio set-default` accepts an exact endpoint ID, exact friendly
+name, or unique case-insensitive friendly-name substring. It sets and verifies
+the Console and Multimedia render defaults. No background watcher runs.

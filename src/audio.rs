@@ -19,8 +19,11 @@ use windows::{
         },
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
-    core::PWSTR,
+    core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR},
 };
+
+const CLSID_POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c171d4f9eaf0de63df40c2bc9);
+const IID_POLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50850a41cf9c72430f290290c8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaClassification {
@@ -139,6 +142,157 @@ pub fn default() -> Result<(), String> {
         println!("{role}: {}", id.as_deref().unwrap_or("unavailable"));
     }
     Ok(())
+}
+
+pub fn set_default(selector: &str) -> Result<(), String> {
+    let endpoints = snapshot(false)?;
+    let endpoint = resolve_endpoint(&endpoints, selector)?;
+    let endpoint_name = endpoint.name.clone();
+    let endpoint_id = endpoint.id.clone();
+
+    let setter_error = set_default_roles(&endpoint_id).err();
+    let defaults = match defaults() {
+        Ok(defaults) => defaults,
+        Err(error) => {
+            return Err(match setter_error {
+                Some(setter_error) => format!(
+                    "selected {endpoint_name:?} ({endpoint_id}), but {setter_error}; cannot verify defaults: {error}"
+                ),
+                None => format!(
+                    "selected {endpoint_name:?} ({endpoint_id}), but cannot verify defaults: {error}"
+                ),
+            });
+        }
+    };
+    let mut failures = Vec::new();
+    if let Some(error) = setter_error {
+        failures.push(error);
+    }
+    for role in ["Console", "Multimedia"] {
+        let selected = defaults
+            .iter()
+            .find(|(current_role, _)| *current_role == role)
+            .and_then(|(_, id)| id.as_deref());
+        if selected != Some(endpoint_id.as_str()) {
+            failures.push(format!(
+                "{role} verification failed: expected {endpoint_id}, got {}",
+                selected.unwrap_or("unavailable")
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "selected {endpoint_name:?} ({endpoint_id}), but {}",
+            failures.join("; ")
+        ));
+    }
+
+    println!("selected {endpoint_name:?} ({endpoint_id})");
+    println!("Console: verified");
+    println!("Multimedia: verified");
+    Ok(())
+}
+
+fn resolve_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Result<&'a Endpoint, String> {
+    if let Some(endpoint) = endpoints.iter().find(|endpoint| endpoint.id == selector) {
+        return Ok(endpoint);
+    }
+
+    let exact = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.name == selector)
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [endpoint] => return Ok(endpoint),
+        [] => {}
+        _ => return Err(format!("audio selector {selector:?} is ambiguous")),
+    }
+
+    let selector = selector.to_ascii_lowercase();
+    let matches = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.name.to_ascii_lowercase().contains(&selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [endpoint] => Ok(endpoint),
+        [] => Err(format!("no audio endpoint matches {selector:?}")),
+        _ => Err(format!(
+            "audio selector {selector:?} is ambiguous: {}",
+            matches
+                .iter()
+                .map(|endpoint| endpoint.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn set_default_roles(endpoint_id: &str) -> Result<(), String> {
+    let _com = ComApartment::initialize()?;
+    let policy: IPolicyConfig =
+        unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL) }
+            .map_err(|error| format!("cannot create audio default setter: {error}"))?;
+    let endpoint_id = endpoint_id
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for (role_name, role) in [("Console", eConsole), ("Multimedia", eMultimedia)] {
+        if let Err(error) =
+            unsafe { policy.set_default_endpoint(PCWSTR(endpoint_id.as_ptr()), role) }
+        {
+            failures.push(format!(
+                "cannot set {role_name} default render endpoint: {error}"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone)]
+struct IPolicyConfig(IUnknown);
+
+unsafe impl Interface for IPolicyConfig {
+    type Vtable = IPolicyConfigVtbl;
+    const IID: GUID = IID_POLICY_CONFIG;
+}
+
+type UnusedPolicyMethod = unsafe extern "system" fn();
+
+#[repr(C)]
+struct IPolicyConfigVtbl {
+    base__: IUnknown_Vtbl,
+    get_mix_format: UnusedPolicyMethod,
+    get_device_format: UnusedPolicyMethod,
+    reset_device_format: UnusedPolicyMethod,
+    set_device_format: UnusedPolicyMethod,
+    get_processing_period: UnusedPolicyMethod,
+    set_processing_period: UnusedPolicyMethod,
+    get_share_mode: UnusedPolicyMethod,
+    set_share_mode: UnusedPolicyMethod,
+    get_property_value: UnusedPolicyMethod,
+    set_property_value: UnusedPolicyMethod,
+    set_default_endpoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        PCWSTR,
+        windows::Win32::Media::Audio::ERole,
+    ) -> HRESULT,
+    set_endpoint_visibility: UnusedPolicyMethod,
+}
+
+impl IPolicyConfig {
+    unsafe fn set_default_endpoint(
+        &self,
+        endpoint_id: PCWSTR,
+        role: windows::Win32::Media::Audio::ERole,
+    ) -> windows::core::Result<()> {
+        unsafe { (self.vtable().set_default_endpoint)(self.as_raw(), endpoint_id, role).ok() }
+    }
 }
 
 fn create_enumerator() -> Result<IMMDeviceEnumerator, String> {
@@ -309,7 +463,10 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NvidiaClassification, classify, is_no_default_error};
+    use super::{
+        Endpoint, EndpointState, NvidiaClassification, classify, is_no_default_error,
+        resolve_endpoint,
+    };
     use windows::core::{Error, HRESULT};
 
     #[test]
@@ -351,5 +508,38 @@ mod tests {
         assert!(!is_no_default_error(&Error::from_hresult(HRESULT(
             0x8000_4005_u32 as i32
         ))));
+    }
+
+    fn endpoint(id: &str, name: &str) -> Endpoint {
+        Endpoint {
+            id: id.into(),
+            name: name.into(),
+            state: EndpointState::Active,
+            active: true,
+            adapter_name: None,
+            manufacturer: None,
+            classification: NvidiaClassification::NonNvidia,
+            classification_evidence: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolves_audio_selectors_by_id_name_then_unique_substring() {
+        let endpoints = [
+            endpoint("id-1", "Desk Speakers"),
+            endpoint("id-2", "USB DAC"),
+        ];
+        assert_eq!(resolve_endpoint(&endpoints, "id-1").unwrap().id, "id-1");
+        assert_eq!(resolve_endpoint(&endpoints, "USB DAC").unwrap().id, "id-2");
+        assert_eq!(resolve_endpoint(&endpoints, "desk").unwrap().id, "id-1");
+    }
+
+    #[test]
+    fn rejects_ambiguous_audio_substrings() {
+        let endpoints = [
+            endpoint("id-1", "Desk Speakers"),
+            endpoint("id-2", "Desk Headset"),
+        ];
+        assert!(resolve_endpoint(&endpoints, "desk").is_err());
     }
 }

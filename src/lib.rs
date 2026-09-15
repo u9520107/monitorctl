@@ -159,6 +159,9 @@ pub fn run_cli() -> Result<(), String> {
             audio::list(true)
         }
         [command, action] if command == "audio" && action == "default" => audio::default(),
+        [command, action, selector] if command == "audio" && action == "set-default" => {
+            set_audio_default(selector)
+        }
         _ => Err(usage()),
     }
 }
@@ -223,7 +226,8 @@ Usage: monitorctl audio <command>\n\
 \n\
 Commands:\n\
   list [--all]                 List render endpoints and metadata\n\
-  default                      Show current render defaults by role\n"
+  default                      Show current render defaults by role\n\
+  set-default <selector>       Set Console and Multimedia defaults\n"
 }
 
 fn profile_help() -> &'static str {
@@ -284,6 +288,10 @@ fn set_osd_opacity(value: &str) -> Result<(), String> {
         config.osd.opacity = opacity;
         save_config(&config)
     })
+}
+
+pub fn set_audio_default(selector: &str) -> Result<(), String> {
+    with_monitorctl_lock(|| audio::set_default(selector))
 }
 
 fn list() -> Result<(), String> {

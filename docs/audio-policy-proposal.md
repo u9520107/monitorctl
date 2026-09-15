@@ -256,7 +256,7 @@ compilation alone. Do not start automatic correction before the setter gate pass
 
 ```text
 [x] Design review and live-inventory behavior agreed
-[ ] Phase 0: read-only baseline and remaining default validation
+[x] Phase 0: read-only baseline
 [ ] Phase 1: explicit default setter
 [ ] Phase 2: tray quick selection
 [ ] Phase 3: live list and suppression decision tests
@@ -358,6 +358,18 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
   correction; Communications remains observed only until later validation.
   Phase 0 exit gate passed. Next action: Phase 1 isolated explicit setter,
   pending explicit authorization for manual audio switching.
+- 2026-09-14: Review fixes preserve `Unknown` for ambiguous vendor metadata
+  and propagate unexpected default-query failures. `cargo fmt --check`,
+  `cargo check`, full `cargo test`, and `git diff --check` pass. A live
+  `audio list --all` probe confirms generic HDMI endpoints remain `unknown`,
+  while NVIDIA endpoints remain classified from adapter metadata. Changes are
+  checkpointed in `e57a8bc` and `c074520`.
+- 2026-09-14: Phase 1 implementation adds isolated `IPolicyConfig` setter
+  plumbing, active endpoint selector validation, Console and Multimedia
+  writes, post-write verification, partial role failure reporting, and focused
+  selector tests. `cargo fmt --check`, `cargo check`, and `cargo test audio`
+  pass. Manual switching remains pending explicit opt-in and Windows target
+  validation; Phase 1 exit gate is not yet passed.
 - Record future sessions here with phase, files changed, checks, manual evidence,
   unresolved items, and the exact next action.
 
