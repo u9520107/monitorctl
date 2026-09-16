@@ -192,6 +192,10 @@ Tray menu rebuilds on opening, so it reflects current Windows display state.
 Manage those entries with `monitorctl hotkey list`, `monitorctl hotkey set`, and
 `monitorctl hotkey delete`; restart the tray after changes.
 
+The `Audio output` submenu lists active render outputs and marks the current
+Multimedia output. Selecting an entry uses the same validated Console and
+Multimedia setter as `audio set-default`; it performs no automatic selection.
+
 Tray results use a native lower-center OSD. Configure opacity from `0.10` to
 `1.00`, or preview it from CLI:
 

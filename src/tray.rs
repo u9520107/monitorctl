@@ -40,6 +40,7 @@ const MENU_PROFILE_BASE: u32 = 2_000;
 const MENU_COLOR_BASE: u32 = 2_500;
 const MENU_RESTORE: u32 = 3_000;
 const MENU_QUIT: u32 = 3_001;
+const MENU_AUDIO_BASE: u32 = 3_500;
 const HOTKEY_BASE: i32 = 4_000;
 const MOD_NOREPEAT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x4000);
 const TRAY_ICON: &[u8] = include_bytes!("../assets/monitorctl.ico");
@@ -68,6 +69,10 @@ enum MenuAction {
     SystemColor {
         path: String,
         label: String,
+    },
+    Audio {
+        id: String,
+        name: String,
     },
     Restore,
 }
@@ -160,7 +165,7 @@ unsafe extern "system" fn window_proc(
 
 unsafe fn show_menu(window: HWND) {
     let Ok(state) = menu_state() else {
-        show_osd("Cannot read monitor state", 5_000);
+        show_osd("Cannot read tray configuration", 5_000);
         return;
     };
     let mut menu_actions = BTreeMap::new();
@@ -189,6 +194,14 @@ unsafe fn show_menu(window: HWND) {
                 label: display.label.clone(),
                 active: display.active,
             },
+        );
+    }
+    if let Some(error) = &state.display_error {
+        append(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            &format!("Unavailable: {error}"),
         );
     }
     append(menu, MF_SEPARATOR, 0, "");
@@ -276,6 +289,45 @@ unsafe fn show_menu(window: HWND) {
         }
     }
     append(menu, MF_SEPARATOR, 0, "");
+    if let Ok(submenu) = CreatePopupMenu() {
+        append_submenu(menu, submenu, "Audio output");
+        for (index, endpoint) in state.audio.iter().enumerate() {
+            let id = MENU_AUDIO_BASE + index as u32;
+            append(
+                submenu,
+                MF_STRING
+                    | if state
+                        .multimedia_default
+                        .as_deref()
+                        .is_some_and(|current| current == endpoint.id)
+                    {
+                        MF_CHECKED
+                    } else {
+                        MENU_ITEM_FLAGS(0)
+                    },
+                id,
+                &endpoint.name,
+            );
+            menu_actions.insert(
+                id,
+                MenuAction::Audio {
+                    id: endpoint.id.clone(),
+                    name: endpoint.name.clone(),
+                },
+            );
+        }
+        if let Some(error) = &state.audio_error {
+            append(
+                submenu,
+                MF_STRING | MF_GRAYED,
+                0,
+                &format!("Unavailable: {error}"),
+            );
+        } else if state.audio.is_empty() {
+            append(submenu, MF_STRING | MF_GRAYED, 0, "No active outputs");
+        }
+    }
+    append(menu, MF_SEPARATOR, 0, "");
     append(
         menu,
         if state.restore_available {
@@ -357,6 +409,10 @@ unsafe fn run_menu_action(window: HWND, command: u32) {
         Some(MenuAction::SystemColor { path, label }) => (
             monitorctl_core::color::use_system_settings_for_path(&path),
             format!("Using system color settings for {label}"),
+        ),
+        Some(MenuAction::Audio { id, name }) => (
+            monitorctl_core::set_audio_default(&id),
+            format!("Selected audio output {name}"),
         ),
         None => return,
     };
@@ -529,8 +585,12 @@ fn parse_hotkey(value: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 
 struct MenuState {
     displays: Vec<MenuDisplay>,
+    display_error: Option<String>,
     profiles: Vec<MenuProfile>,
     colors: Vec<MenuColor>,
+    audio: Vec<monitorctl_core::audio::Endpoint>,
+    audio_error: Option<String>,
+    multimedia_default: Option<String>,
     active_count: usize,
     restore_available: bool,
 }
@@ -562,93 +622,115 @@ struct MenuColor {
 
 fn menu_state() -> std::result::Result<MenuState, String> {
     let config = load_config()?;
-    let discovered = discover_displays()?;
-    let active = active_paths(&discovered);
-    let mut displays = discovered
-        .iter()
-        .map(|display| {
-            let alias = alias_for_display(&config, &discovered, display);
-            MenuDisplay {
-                label: display_label(alias, &display.friendly_name),
-                path: Some(display.device_path.clone()),
-                active: display.active,
-            }
-        })
-        .collect::<Vec<_>>();
-    displays.extend(
-        config
-            .displays
-            .iter()
-            .filter(|(_, identity)| resolve_identity(&discovered, identity).is_err())
-            .map(|(alias, _)| MenuDisplay {
-                label: format!("{alias}  Unavailable"),
-                path: None,
-                active: false,
-            }),
-    );
-    let profiles = config
-        .profiles
-        .iter()
-        .map(|(name, identities)| {
-            let displays = identities
-                .iter()
-                .map(|identity| {
-                    let label = resolve_identity(&discovered, identity)
-                        .map(|display| {
-                            display_label(
-                                alias_for_display(&config, &discovered, display),
-                                &display.friendly_name,
-                            )
+    let (displays, display_error, profiles, colors, active_count, restore_available) =
+        match discover_displays() {
+            Ok(discovered) => {
+                let active = active_paths(&discovered);
+                let mut displays = discovered
+                    .iter()
+                    .map(|display| {
+                        let alias = alias_for_display(&config, &discovered, display);
+                        MenuDisplay {
+                            label: display_label(alias, &display.friendly_name),
+                            path: Some(display.device_path.clone()),
+                            active: display.active,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                displays.extend(
+                    config
+                        .displays
+                        .iter()
+                        .filter(|(_, identity)| resolve_identity(&discovered, identity).is_err())
+                        .map(|(alias, _)| MenuDisplay {
+                            label: format!("{alias}  Unavailable"),
+                            path: None,
+                            active: false,
+                        }),
+                );
+                let profiles = config
+                    .profiles
+                    .iter()
+                    .map(|(name, identities)| {
+                        let displays = identities
+                            .iter()
+                            .map(|identity| {
+                                let label = resolve_identity(&discovered, identity)
+                                    .map(|display| {
+                                        display_label(
+                                            alias_for_display(&config, &discovered, display),
+                                            &display.friendly_name,
+                                        )
+                                    })
+                                    .unwrap_or_else(|_| {
+                                        identity
+                                            .friendly_name
+                                            .clone()
+                                            .unwrap_or_else(|| "Unavailable display".into())
+                                    });
+                                MenuProfileDisplay { label }
+                            })
+                            .collect();
+                        let resolved = resolve_identities(&discovered, identities);
+                        MenuProfile {
+                            name: name.clone(),
+                            displays,
+                            available: !identities.is_empty() && resolved.is_ok(),
+                            active: resolved.is_ok_and(|paths| paths == active),
+                        }
+                    })
+                    .collect();
+                let colors = discovered
+                    .iter()
+                    .filter(|display| display.active)
+                    .filter_map(|display| {
+                        let alias = alias_for_display(&config, &discovered, display);
+                        let label = display_label(alias, &display.friendly_name);
+                        let profiles =
+                            monitorctl_core::color::safe_profiles_for_path(&display.device_path)
+                                .unwrap_or_default();
+                        (!profiles.is_empty()).then(|| MenuColor {
+                            label,
+                            path: display.device_path.clone(),
+                            uses_current_user_settings:
+                                monitorctl_core::color::uses_current_user_settings_for_path(
+                                    &display.device_path,
+                                )
+                                .unwrap_or(false),
+                            current: monitorctl_core::color::current_for_path(&display.device_path)
+                                .ok()
+                                .flatten(),
+                            profiles,
                         })
-                        .unwrap_or_else(|_| {
-                            identity
-                                .friendly_name
-                                .clone()
-                                .unwrap_or_else(|| "Unavailable display".into())
-                        });
-                    MenuProfileDisplay { label }
-                })
-                .collect();
-            let resolved = resolve_identities(&discovered, identities);
-            MenuProfile {
-                name: name.clone(),
-                displays,
-                available: !identities.is_empty() && resolved.is_ok(),
-                active: resolved.is_ok_and(|paths| paths == active),
+                    })
+                    .collect();
+                let restore_available = config.previous_active.as_ref().is_some_and(|identities| {
+                    !identities.is_empty() && resolve_identities(&discovered, identities).is_ok()
+                });
+                (
+                    displays,
+                    None,
+                    profiles,
+                    colors,
+                    active.len(),
+                    restore_available,
+                )
             }
-        })
-        .collect();
-    let colors = discovered
-        .iter()
-        .filter(|display| display.active)
-        .filter_map(|display| {
-            let alias = alias_for_display(&config, &discovered, display);
-            let label = display_label(alias, &display.friendly_name);
-            let profiles = monitorctl_core::color::safe_profiles_for_path(&display.device_path)
-                .unwrap_or_default();
-            (!profiles.is_empty()).then(|| MenuColor {
-                label,
-                path: display.device_path.clone(),
-                uses_current_user_settings:
-                    monitorctl_core::color::uses_current_user_settings_for_path(
-                        &display.device_path,
-                    )
-                    .unwrap_or(false),
-                current: monitorctl_core::color::current_for_path(&display.device_path)
-                    .ok()
-                    .flatten(),
-                profiles,
-            })
-        })
-        .collect();
-    let restore_available = config.previous_active.as_ref().is_some_and(|identities| {
-        !identities.is_empty() && resolve_identities(&discovered, identities).is_ok()
-    });
+            Err(error) => (Vec::new(), Some(error), Vec::new(), Vec::new(), 0, false),
+        };
+    let (audio, multimedia_default, audio_error) = match monitorctl_core::audio::tray_snapshot() {
+        Ok((audio, multimedia_default)) => (audio, multimedia_default, None),
+        Err(error) => (Vec::new(), None, Some(error)),
+    };
     Ok(MenuState {
         displays,
+        display_error,
         profiles,
         colors,
-        active_count: active.len(),
+        audio,
+        audio_error,
+        multimedia_default,
+        active_count,
         restore_available,
     })
 }

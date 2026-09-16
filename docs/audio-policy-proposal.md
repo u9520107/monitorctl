@@ -391,6 +391,13 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
   Focusrite restore, confirming setter role scope. Phase 1 exit gate passed.
 - Record future sessions here with phase, files changed, checks, manual evidence,
   unresolved items, and the exact next action.
+- 2026-09-14: Phase 2 implementation adds an `Audio output` tray submenu with
+  active endpoint names, a Multimedia-default checkmark, exact endpoint IDs in
+  menu actions, and shared validated Console/Multimedia selection. Display and
+  audio discovery failures now render independently in the tray menu. `cargo
+  fmt --check`, `cargo check`, `cargo test audio`, and `git diff --check` pass.
+  No watcher or automatic selection was added. Manual tray switching and stale
+  menu validation remain pending the next authorized interactive tray test.
 
 ## Sources
 

@@ -193,6 +193,15 @@ pub fn set_default(selector: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn tray_snapshot() -> Result<(Vec<Endpoint>, Option<String>), String> {
+    let endpoints = snapshot(false)?;
+    let multimedia = defaults()?
+        .into_iter()
+        .find(|(role, _)| *role == "Multimedia")
+        .and_then(|(_, id)| id);
+    Ok((endpoints, multimedia))
+}
+
 fn resolve_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Result<&'a Endpoint, String> {
     if let Some(endpoint) = endpoints.iter().find(|endpoint| endpoint.id == selector) {
         return Ok(endpoint);
