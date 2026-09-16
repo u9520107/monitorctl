@@ -289,43 +289,41 @@ unsafe fn show_menu(window: HWND) {
         }
     }
     append(menu, MF_SEPARATOR, 0, "");
-    if let Ok(submenu) = CreatePopupMenu() {
-        append_submenu(menu, submenu, "Audio output");
-        for (index, endpoint) in state.audio.iter().enumerate() {
-            let id = MENU_AUDIO_BASE + index as u32;
-            append(
-                submenu,
-                MF_STRING
-                    | if state
-                        .multimedia_default
-                        .as_deref()
-                        .is_some_and(|current| current == endpoint.id)
-                    {
-                        MF_CHECKED
-                    } else {
-                        MENU_ITEM_FLAGS(0)
-                    },
-                id,
-                &endpoint.name,
-            );
-            menu_actions.insert(
-                id,
-                MenuAction::Audio {
-                    id: endpoint.id.clone(),
-                    name: endpoint.name.clone(),
+    append(menu, MF_STRING | MF_DISABLED, 0, "Audio output");
+    for (index, endpoint) in state.audio.iter().enumerate() {
+        let id = MENU_AUDIO_BASE + index as u32;
+        append(
+            menu,
+            MF_STRING
+                | if state
+                    .multimedia_default
+                    .as_deref()
+                    .is_some_and(|current| current == endpoint.id)
+                {
+                    MF_CHECKED
+                } else {
+                    MENU_ITEM_FLAGS(0)
                 },
-            );
-        }
-        if let Some(error) = &state.audio_error {
-            append(
-                submenu,
-                MF_STRING | MF_GRAYED,
-                0,
-                &format!("Unavailable: {error}"),
-            );
-        } else if state.audio.is_empty() {
-            append(submenu, MF_STRING | MF_GRAYED, 0, "No active outputs");
-        }
+            id,
+            &endpoint.name,
+        );
+        menu_actions.insert(
+            id,
+            MenuAction::Audio {
+                id: endpoint.id.clone(),
+                name: endpoint.name.clone(),
+            },
+        );
+    }
+    if let Some(error) = &state.audio_error {
+        append(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            &format!("Unavailable: {error}"),
+        );
+    } else if state.audio.is_empty() {
+        append(menu, MF_STRING | MF_GRAYED, 0, "No active outputs");
     }
     append(menu, MF_SEPARATOR, 0, "");
     append(

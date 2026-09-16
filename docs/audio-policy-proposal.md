@@ -203,7 +203,7 @@ endpoints for diagnostics only. Read-only commands do not mutate saved state.
 `set-default` performs explicit validated selection and verifies managed roles.
 The watcher observes successful CLI/Windows changes through normal notifications.
 
-The tray provides an **Audio output** submenu listing active outputs, a marker
+The tray provides an **Audio output** section listing active outputs, a marker
 for the current Multimedia output, and **Suppress NVIDIA audio** checkbox.
 Expose errors through existing mechanisms; do not add optional OSD settings in v1.
 Revalidate a clicked endpoint ID because devices can disappear while a menu is open.
@@ -265,7 +265,7 @@ compilation alone. Do not start automatic correction before the setter gate pass
 [x] Design review and live-inventory behavior agreed
 [x] Phase 0: read-only baseline
 [x] Phase 1: explicit default setter
-[ ] Phase 2: tray quick selection
+[x] Phase 2: tray quick selection
 [ ] Phase 3: live list and suppression decision tests
 [ ] Phase 4: tray observation and automatic correction
 [ ] Phase 5: Windows/NVIDIA validation
@@ -391,13 +391,15 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
   Focusrite restore, confirming setter role scope. Phase 1 exit gate passed.
 - Record future sessions here with phase, files changed, checks, manual evidence,
   unresolved items, and the exact next action.
-- 2026-09-14: Phase 2 implementation adds an `Audio output` tray submenu with
-  active endpoint names, a Multimedia-default checkmark, exact endpoint IDs in
-  menu actions, and shared validated Console/Multimedia selection. Display and
-  audio discovery failures now render independently in the tray menu. `cargo
-  fmt --check`, `cargo check`, `cargo test audio`, and `git diff --check` pass.
-  No watcher or automatic selection was added. Manual tray switching and stale
-  menu validation remain pending the next authorized interactive tray test.
+- 2026-09-15: Phase 2 implementation adds a flat `Audio output` tray section
+  with active endpoint names, a Multimedia-default checkmark, exact endpoint
+  IDs in menu actions, and shared validated Console/Multimedia selection.
+  Display and audio discovery failures render independently in the tray menu.
+  Manual testing with Focusrite and Realtek confirmed the menu and switching
+  behavior; Communications stayed unchanged. An exact stale endpoint ID was
+  rejected before any write. `cargo fmt --check`, `cargo check`, full
+  `cargo test`, `cargo build --bin monitorctl-tray`, and `git diff --check`
+  pass. No watcher or automatic selection was added. Phase 2 exit gate passed.
 
 ## Sources
 
