@@ -641,6 +641,8 @@ pub struct Config {
     pub hotkeys: BTreeMap<String, HotkeyAction>,
     #[serde(default)]
     pub osd: OsdConfig,
+    #[serde(default, skip_serializing_if = "audio::AudioConfig::is_default")]
+    pub audio: audio::AudioConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_active: Option<Vec<DisplayIdentity>>,
 }
@@ -1475,6 +1477,18 @@ mod tests {
         let config = Config::from_toml("[displays]\ndesk = \"old-path\"").unwrap();
         assert_eq!(config.displays["desk"].device_path, "old-path");
         assert_eq!(config.displays["desk"].serial, None);
+        assert_eq!(config.audio, audio::AudioConfig::default());
+    }
+
+    #[test]
+    fn preserves_audio_config_only_when_configured() {
+        let mut config = Config::default();
+        assert!(!config.to_toml().unwrap().contains("[audio]"));
+
+        config.audio.suppress_nvidia = true;
+        config.audio.order = vec!["endpoint-id".into()];
+        let loaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(loaded.audio, config.audio);
     }
 
     #[test]

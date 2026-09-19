@@ -266,7 +266,7 @@ compilation alone. Do not start automatic correction before the setter gate pass
 [x] Phase 0: read-only baseline
 [x] Phase 1: explicit default setter
 [x] Phase 2: tray quick selection
-[ ] Phase 3: live list and suppression decision tests
+[x] Phase 3: live list and suppression decision tests
 [ ] Phase 4: tray observation and automatic correction
 [ ] Phase 5: Windows/NVIDIA validation
 ```
@@ -400,6 +400,16 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
   rejected before any write. `cargo fmt --check`, `cargo check`, full
   `cargo test`, `cargo build --bin monitorctl-tray`, and `git diff --check`
   pass. No watcher or automatic selection was added. Phase 2 exit gate passed.
+- 2026-09-16: Phase 3 adds backward-compatible `[audio]` configuration with
+  suppression disabled by default and an exact-ID saved-order restart seed.
+  Pure reconciliation decisions retain active order, remove unavailable IDs,
+  append new IDs deterministically, promote eligible defaults, and identify
+  NVIDIA fallback or unavailable fallback without calling any setter. Tests
+  cover suppression modes, duplicate names, unknown classification, removal
+  and reconnect, startup reconciliation, and failed versus empty enumeration.
+  `cargo fmt --check`, `cargo check`, `cargo test`, and `git diff --check` pass.
+  Phase 3 exit gate passed. Next action: Phase 4 tray observation and bounded
+  automatic correction.
 
 ## Sources
 

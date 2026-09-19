@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::{
@@ -30,6 +32,35 @@ pub enum NvidiaClassification {
     Nvidia,
     NonNvidia,
     Unknown,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AudioConfig {
+    #[serde(default)]
+    pub suppress_nvidia: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+}
+
+impl AudioConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        !self.suppress_nvidia && self.order.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioDecision {
+    Noop,
+    Promote(String),
+    Restore(String),
+    NoEligibleFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioReconciliation {
+    pub order: Vec<String>,
+    pub decision: AudioDecision,
+    pub enumeration_failed: bool,
 }
 
 impl fmt::Display for NvidiaClassification {
@@ -200,6 +231,82 @@ pub fn tray_snapshot() -> Result<(Vec<Endpoint>, Option<String>), String> {
         .find(|(role, _)| *role == "Multimedia")
         .and_then(|(_, id)| id);
     Ok((endpoints, multimedia))
+}
+
+pub fn reconcile(
+    saved_order: &[String],
+    endpoints: Result<&[Endpoint], ()>,
+    current_default: Option<&str>,
+    suppress_nvidia: bool,
+) -> AudioReconciliation {
+    let Ok(endpoints) = endpoints else {
+        return AudioReconciliation {
+            order: saved_order.to_vec(),
+            decision: AudioDecision::Noop,
+            enumeration_failed: true,
+        };
+    };
+
+    let active = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.active && endpoint.state == EndpointState::Active)
+        .collect::<Vec<_>>();
+    let active_ids = active
+        .iter()
+        .map(|endpoint| endpoint.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut order = Vec::with_capacity(active.len());
+    for id in saved_order {
+        if active_ids.contains(id.as_str()) && !order.iter().any(|existing| existing == id) {
+            order.push(id.clone());
+        }
+    }
+    let mut new_endpoints = active
+        .iter()
+        .filter(|endpoint| !order.iter().any(|id| id == &endpoint.id))
+        .collect::<Vec<_>>();
+    new_endpoints.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then(left.id.cmp(&right.id))
+    });
+    order.extend(
+        new_endpoints
+            .into_iter()
+            .map(|endpoint| endpoint.id.clone()),
+    );
+
+    let decision = current_default
+        .and_then(|id| active.iter().find(|endpoint| endpoint.id == id))
+        .map_or(AudioDecision::Noop, |current| {
+            if !suppress_nvidia {
+                return AudioDecision::Promote(current.id.clone());
+            }
+            match current.classification {
+                NvidiaClassification::NonNvidia => AudioDecision::Promote(current.id.clone()),
+                NvidiaClassification::Nvidia => order
+                    .iter()
+                    .filter_map(|id| active.iter().find(|endpoint| endpoint.id == *id))
+                    .find(|endpoint| endpoint.classification == NvidiaClassification::NonNvidia)
+                    .map(|endpoint| AudioDecision::Restore(endpoint.id.clone()))
+                    .unwrap_or(AudioDecision::NoEligibleFallback),
+                NvidiaClassification::Unknown => AudioDecision::Noop,
+            }
+        });
+
+    if let AudioDecision::Promote(id) = &decision {
+        if let Some(position) = order.iter().position(|candidate| candidate == id) {
+            let id = order.remove(position);
+            order.insert(0, id);
+        }
+    }
+
+    AudioReconciliation {
+        order,
+        decision,
+        enumeration_failed: false,
+    }
 }
 
 fn resolve_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Result<&'a Endpoint, String> {
@@ -473,8 +580,8 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Endpoint, EndpointState, NvidiaClassification, classify, is_no_default_error,
-        resolve_endpoint,
+        AudioDecision, Endpoint, EndpointState, NvidiaClassification, classify,
+        is_no_default_error, reconcile, resolve_endpoint,
     };
     use windows::core::{Error, HRESULT};
 
@@ -530,6 +637,144 @@ mod tests {
             classification: NvidiaClassification::NonNvidia,
             classification_evidence: String::new(),
         }
+    }
+
+    fn classified_endpoint(id: &str, name: &str, classification: NvidiaClassification) -> Endpoint {
+        Endpoint {
+            classification,
+            ..endpoint(id, name)
+        }
+    }
+
+    #[test]
+    fn reconciles_active_ids_and_appends_new_outputs_deterministically() {
+        let endpoints = [
+            endpoint("id-b", "Same name"),
+            endpoint("id-a", "Same name"),
+            endpoint("id-c", "Other name"),
+        ];
+        let result = reconcile(
+            &["removed".into(), "id-b".into(), "id-b".into()],
+            Ok(&endpoints),
+            None,
+            false,
+        );
+
+        assert_eq!(result.order, ["id-b", "id-c", "id-a"]);
+        assert_eq!(result.decision, AudioDecision::Noop);
+        assert!(!result.enumeration_failed);
+    }
+
+    #[test]
+    fn reconnected_output_is_appended_after_live_removal() {
+        let endpoints = [endpoint("id-a", "A"), endpoint("id-b", "B")];
+        let present = reconcile(
+            &["id-a".into(), "id-b".into()],
+            Ok(&endpoints[..1]),
+            None,
+            false,
+        );
+        let returned = reconcile(&present.order, Ok(&endpoints), None, false);
+
+        assert_eq!(present.order, ["id-a"]);
+        assert_eq!(returned.order, ["id-a", "id-b"]);
+    }
+
+    #[test]
+    fn promotes_selected_output_by_exact_id() {
+        let endpoints = [endpoint("id-a", "Speakers"), endpoint("id-b", "Headset")];
+        let result = reconcile(
+            &["id-a".into(), "id-b".into()],
+            Ok(&endpoints),
+            Some("id-b"),
+            false,
+        );
+
+        assert_eq!(result.order, ["id-b", "id-a"]);
+        assert_eq!(result.decision, AudioDecision::Promote("id-b".into()));
+    }
+
+    #[test]
+    fn suppression_restores_first_known_non_nvidia_output() {
+        let endpoints = [
+            classified_endpoint("nvidia", "Monitor", NvidiaClassification::Nvidia),
+            classified_endpoint("dac", "DAC", NvidiaClassification::NonNvidia),
+            classified_endpoint("unknown", "HDMI", NvidiaClassification::Unknown),
+        ];
+        let result = reconcile(
+            &["nvidia".into(), "unknown".into(), "dac".into()],
+            Ok(&endpoints),
+            Some("nvidia"),
+            true,
+        );
+
+        assert_eq!(result.order, ["nvidia", "unknown", "dac"]);
+        assert_eq!(result.decision, AudioDecision::Restore("dac".into()));
+    }
+
+    #[test]
+    fn suppression_accepts_non_nvidia_and_nvidia_when_disabled() {
+        let endpoints = [
+            classified_endpoint("nvidia", "Monitor", NvidiaClassification::Nvidia),
+            classified_endpoint("dac", "DAC", NvidiaClassification::NonNvidia),
+        ];
+        let accepted = reconcile(
+            &["dac".into(), "nvidia".into()],
+            Ok(&endpoints),
+            Some("dac"),
+            true,
+        );
+        let allowed = reconcile(
+            &["dac".into(), "nvidia".into()],
+            Ok(&endpoints),
+            Some("nvidia"),
+            false,
+        );
+
+        assert_eq!(accepted.decision, AudioDecision::Promote("dac".into()));
+        assert_eq!(allowed.decision, AudioDecision::Promote("nvidia".into()));
+        assert_eq!(allowed.order, ["nvidia", "dac"]);
+    }
+
+    #[test]
+    fn suppression_reports_missing_fallback_and_skips_unknown_classification() {
+        let nvidia = classified_endpoint("nvidia", "Monitor", NvidiaClassification::Nvidia);
+        let unknown = classified_endpoint("unknown", "HDMI", NvidiaClassification::Unknown);
+        let no_fallback = reconcile(
+            &["nvidia".into(), "unknown".into()],
+            Ok(&[nvidia, unknown]),
+            Some("nvidia"),
+            true,
+        );
+
+        assert_eq!(no_fallback.decision, AudioDecision::NoEligibleFallback);
+        assert_eq!(
+            reconcile(
+                &["unknown".into()],
+                Ok(&[classified_endpoint(
+                    "unknown",
+                    "HDMI",
+                    NvidiaClassification::Unknown,
+                )]),
+                Some("unknown"),
+                true,
+            )
+            .decision,
+            AudioDecision::Noop
+        );
+    }
+
+    #[test]
+    fn failed_enumeration_keeps_seed_but_empty_success_clears_it() {
+        let seed = ["id-a".into()];
+        let failed = reconcile(&seed, Err(()), Some("id-a"), true);
+        let empty = reconcile(&seed, Ok(&[]), Some("id-a"), true);
+
+        assert_eq!(failed.order, seed);
+        assert!(failed.enumeration_failed);
+        assert!(empty.order.is_empty());
+        assert!(!empty.enumeration_failed);
+        assert_eq!(empty.decision, AudioDecision::Noop);
     }
 
     #[test]
