@@ -504,7 +504,10 @@ fn watcher_worker(receiver: mpsc::Receiver<WatcherSignal>, sender: mpsc::Sender<
         return;
     }
 
-    process_burst(&receiver);
+    if process_burst(&receiver) {
+        let _ = unsafe { enumerator.UnregisterEndpointNotificationCallback(&callback) };
+        return;
+    }
     while let Ok(signal) = receiver.recv() {
         if matches!(signal, WatcherSignal::Stop) {
             break;
@@ -531,7 +534,7 @@ fn process_burst(receiver: &mpsc::Receiver<WatcherSignal>) -> bool {
             Err(error) => {
                 report_watcher_status(error);
                 if attempts == 3 {
-                    return false;
+                    return settle_burst(&receiver);
                 }
                 attempts += 1;
                 match receiver.recv_timeout(Duration::from_secs(1)) {
@@ -540,6 +543,17 @@ fn process_burst(receiver: &mpsc::Receiver<WatcherSignal>) -> bool {
                     Err(mpsc::RecvTimeoutError::Disconnected) => return true,
                 }
             }
+        }
+    }
+}
+
+fn settle_burst(receiver: &mpsc::Receiver<WatcherSignal>) -> bool {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(WatcherSignal::Stop) => return true,
+            Ok(WatcherSignal::Event) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => return false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
         }
     }
 }
