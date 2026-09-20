@@ -652,7 +652,11 @@ fn nvidia_roles(
         .filter(|role| {
             default_id(defaults, role)
                 .and_then(|id| endpoints.iter().find(|endpoint| endpoint.id == id))
-                .is_some_and(|endpoint| endpoint.classification == NvidiaClassification::Nvidia)
+                .is_some_and(|endpoint| {
+                    endpoint.active
+                        && endpoint.state == EndpointState::Active
+                        && endpoint.classification == NvidiaClassification::Nvidia
+                })
         })
         .collect()
 }
@@ -945,6 +949,14 @@ mod tests {
         }
     }
 
+    fn inactive_endpoint(id: &str, name: &str, classification: NvidiaClassification) -> Endpoint {
+        Endpoint {
+            state: EndpointState::NotPresent,
+            active: false,
+            ..classified_endpoint(id, name, classification)
+        }
+    }
+
     #[test]
     fn reconciles_active_ids_and_appends_new_outputs_deterministically() {
         let endpoints = [
@@ -1064,6 +1076,35 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_ignores_inactive_endpoints() {
+        let endpoints = [
+            endpoint("active", "Speakers"),
+            inactive_endpoint("disabled", "Disabled", NvidiaClassification::NonNvidia),
+        ];
+        let result = reconcile(
+            &["disabled".into(), "active".into()],
+            Ok(&endpoints),
+            Some("disabled"),
+            true,
+        );
+
+        assert_eq!(result.order, ["active"]);
+        assert_eq!(result.decision, AudioDecision::Noop);
+    }
+
+    #[test]
+    fn inactive_nvidia_default_is_never_corrected() {
+        let endpoints = [inactive_endpoint(
+            "nvidia",
+            "Monitor",
+            NvidiaClassification::Nvidia,
+        )];
+        let defaults = [("Console", Some("nvidia".into()))];
+
+        assert!(nvidia_roles(&endpoints, &defaults).is_empty());
+    }
+
+    #[test]
     fn correction_targets_only_current_nvidia_managed_roles() {
         let endpoints = [
             classified_endpoint("nvidia", "Monitor", NvidiaClassification::Nvidia),
@@ -1099,6 +1140,13 @@ mod tests {
         assert_eq!(resolve_endpoint(&endpoints, "id-1").unwrap().id, "id-1");
         assert_eq!(resolve_endpoint(&endpoints, "USB DAC").unwrap().id, "id-2");
         assert_eq!(resolve_endpoint(&endpoints, "desk").unwrap().id, "id-1");
+    }
+
+    #[test]
+    fn exact_audio_name_precedes_a_broader_substring_match() {
+        let endpoints = [endpoint("id-1", "Desk"), endpoint("id-2", "Desk Speakers")];
+
+        assert_eq!(resolve_endpoint(&endpoints, "Desk").unwrap().id, "id-1");
     }
 
     #[test]

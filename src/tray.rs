@@ -305,7 +305,7 @@ unsafe fn show_menu(window: HWND) {
         }
     }
     append(menu, MF_SEPARATOR, 0, "");
-    append(menu, MF_STRING | MF_DISABLED, 0, "Audio output");
+    append(menu, MF_STRING | MF_DISABLED, 0, "Audio Device");
     append(
         menu,
         MF_STRING
@@ -315,12 +315,13 @@ unsafe fn show_menu(window: HWND) {
                 MENU_ITEM_FLAGS(0)
             },
         MENU_AUDIO_SUPPRESS,
-        "Suppress NVIDIA audio",
+        "Suppress Nvidia audio",
     );
     menu_actions.insert(
         MENU_AUDIO_SUPPRESS,
         MenuAction::ToggleAudioSuppression(state.suppress_nvidia),
     );
+    append(menu, MF_STRING | MF_DISABLED, 0, "Devices:");
     for (index, endpoint) in state.audio.iter().enumerate() {
         let id = MENU_AUDIO_BASE + index as u32;
         append(
@@ -336,7 +337,7 @@ unsafe fn show_menu(window: HWND) {
                     MENU_ITEM_FLAGS(0)
                 },
             id,
-            &endpoint.name,
+            &format!("    - {}", endpoint.name),
         );
         menu_actions.insert(
             id,
