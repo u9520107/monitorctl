@@ -91,6 +91,35 @@ monitorctl osd show "Displays ready"
 monitorctl osd opacity 0.85
 ```
 
+### Audio output
+
+Inspect active Windows render outputs and current defaults:
+
+```powershell
+monitorctl audio list
+monitorctl audio list --all
+monitorctl audio default
+monitorctl audio set-default "Speakers (Focusrite USB Audio)"
+```
+
+`audio list` shows active render endpoints, exact endpoint IDs, friendly names,
+state, adapter metadata, NVIDIA classification evidence, and Console,
+Multimedia, or Communications role assignments. `audio list --all` also shows
+disabled, unplugged, and not-present endpoints for diagnostics.
+
+`audio set-default` accepts an exact endpoint ID, exact friendly name, or a
+unique case-insensitive friendly-name substring. Ambiguous and unavailable
+selectors fail before any Windows change. A successful selection sets and
+verifies the Console and Multimedia render roles. Communications and capture
+defaults remain unchanged.
+
+Audio state is stored in the optional `[audio]` section of
+`%LOCALAPPDATA%\monitorctl\monitorctl.toml`. `suppress_nvidia` defaults to
+`false`. The saved `order` contains exact IDs observed from active endpoints;
+it is a restart seed, not a user priority list. Removed endpoints are removed
+from live order. Returning endpoints are appended, then move to the front only
+when Windows selects them.
+
 ## Portable package
 
 The portable Windows package contains `monitorctl.exe`, `monitorctl-tray.exe`,
@@ -123,8 +152,8 @@ or non-desktop sessions cannot call `SetDisplayConfig`.
 
 ## Monitor selection
 
-Numeric indexes are Phase 1 probe behavior only; Windows does not guarantee
-their order. Commands resolve monitors in this order:
+Numeric indexes are diagnostic only; Windows does not guarantee their order.
+Commands resolve monitors in this order:
 
 1. exact friendly monitor name; then
 2. case-insensitive unique substring of friendly monitor name.
@@ -191,6 +220,33 @@ cargo run --bin monitorctl-tray
 Tray menu rebuilds on opening, so it reflects current Windows display state.
 Manage those entries with `monitorctl hotkey list`, `monitorctl hotkey set`, and
 `monitorctl hotkey delete`; restart the tray after changes.
+
+The `Audio output` section lists active render outputs and marks the current
+Multimedia output. Selecting an entry uses the same validated Console and
+Multimedia setter as `audio set-default`. The tray revalidates the exact
+endpoint ID when a menu entry is clicked, so a device that disappears while
+the menu is open fails safely.
+
+`Suppress NVIDIA audio` enables the tray-owned audio watcher and evaluates the
+current defaults immediately. While enabled, NVIDIA endpoints remain visible
+but explicit NVIDIA selection is rejected. If Windows selects an active known
+NVIDIA render endpoint, the watcher corrects only managed roles currently on
+NVIDIA to the first active known non-NVIDIA output in observed order. It does
+not change valid non-NVIDIA roles, missing defaults, unknown classifications,
+Communications, or capture defaults. With suppression disabled, Windows audio
+selection is observed but never corrected. The watcher runs only inside the
+tray; the CLI has no background process.
+
+Audio discovery and correction failures stay separate from monitor menus and
+hotkeys. The watcher coalesces device events, retries transient correction
+failures a bounded number of times, and stops rather than continually forcing
+Windows defaults. No audio endpoint is automatically enabled or disabled.
+
+Future enhancement: a tray action could explicitly enable or disable a Windows
+audio endpoint. That would change global Windows device availability, so it
+needs exact identity validation, post-action verification, clear warnings, and
+an explicit user action. Automatic endpoint enable or disable remains out of
+scope.
 
 Tray results use a native lower-center OSD. Configure opacity from `0.10` to
 `1.00`, or preview it from CLI:

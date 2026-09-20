@@ -1,3 +1,5 @@
+extern crate windows_core;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -11,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, WAIT_ABANDONED,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+            GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
         System::{
@@ -32,11 +34,13 @@ use windows::Win32::Devices::Display::{
     SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE, SET_DISPLAY_CONFIG_FLAGS, SetDisplayConfig,
 };
 
+pub mod audio;
 pub mod color;
 pub mod osd;
 
 const MONITORCTL_MUTEX_NAME: &str = "Local\\monitorctl-operation";
 const MONITORCTL_MUTEX_WAIT_MS: u32 = 10_000;
+const MONITORCTL_TRAY_MUTEX_NAME: &str = "Local\\monitorctl-tray";
 static CONFIG_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct MonitorctlLock(HANDLE);
@@ -79,6 +83,28 @@ fn with_monitorctl_lock<T>(action: impl FnOnce() -> Result<T, String>) -> Result
     action()
 }
 
+pub struct TrayInstanceLock(HANDLE);
+
+pub fn acquire_tray_instance() -> Result<TrayInstanceLock, String> {
+    let name = MONITORCTL_TRAY_MUTEX_NAME
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        .map_err(|error| format!("cannot create tray instance lock: {error}"))?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle) }.ok();
+        return Err("monitorctl-tray is already running".into());
+    }
+    Ok(TrayInstanceLock(handle))
+}
+
+impl Drop for TrayInstanceLock {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) }.ok();
+    }
+}
+
 pub fn run_cli() -> Result<(), String> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
 
@@ -88,6 +114,7 @@ pub fn run_cli() -> Result<(), String> {
         [command, topic] if command == "help" && topic == "hotkey" => print_help(hotkey_help()),
         [command, topic] if command == "help" && topic == "osd" => print_help(osd_help()),
         [command, topic] if command == "help" && topic == "color" => print_help(color_help()),
+        [command, topic] if command == "help" && topic == "audio" => print_help(audio_help()),
         [topic, command]
             if topic == "profile" && matches!(command.as_str(), "--help" | "-h" | "help") =>
         {
@@ -107,6 +134,11 @@ pub fn run_cli() -> Result<(), String> {
             if topic == "color" && matches!(command.as_str(), "--help" | "-h" | "help") =>
         {
             print_help(color_help())
+        }
+        [topic, command]
+            if topic == "audio" && matches!(command.as_str(), "--help" | "-h" | "help") =>
+        {
+            print_help(audio_help())
         }
         [] => list(),
         [command] if command == "list" => list(),
@@ -147,6 +179,14 @@ pub fn run_cli() -> Result<(), String> {
         [command, action, monitor, file] if command == "color" && action == "set" => {
             color::set(monitor, file)
         }
+        [command, action] if command == "audio" && action == "list" => audio::list(false),
+        [command, action, flag] if command == "audio" && action == "list" && flag == "--all" => {
+            audio::list(true)
+        }
+        [command, action] if command == "audio" && action == "default" => audio::default(),
+        [command, action, selector] if command == "audio" && action == "set-default" => {
+            set_audio_default(selector)
+        }
         _ => Err(usage()),
     }
 }
@@ -174,6 +214,7 @@ Commands:\n\
   hotkey <command>             Manage tray global-hotkey configuration\n\
   osd <command>                Show OSD or set its opacity\n\
   color <command>              Manage per-monitor ICC profiles\n\
+  audio <command>              Inspect Windows render audio endpoints\n\
   help, --help, -h             Show this help\n\
 \n\
 Display selectors: exact friendly name, then unique case-insensitive\n\
@@ -202,6 +243,16 @@ Profiles remain separate from active-display profiles. `set` accepts an exact\n\
 filename or unique case-insensitive filename substring. It requires a normal\n\
 profile for SDR or an advanced profile for Windows advanced color. Monitor\n\
 selectors use exact or unique case-insensitive friendly-name substring.\n"
+}
+
+fn audio_help() -> &'static str {
+    "\
+Usage: monitorctl audio <command>\n\
+\n\
+Commands:\n\
+  list [--all]                 List render endpoints and metadata\n\
+  default                      Show current render defaults by role\n\
+  set-default <selector>       Set Console and Multimedia defaults\n"
 }
 
 fn profile_help() -> &'static str {
@@ -260,6 +311,18 @@ fn set_osd_opacity(value: &str) -> Result<(), String> {
     with_monitorctl_lock(|| {
         let mut config = load_config()?;
         config.osd.opacity = opacity;
+        save_config(&config)
+    })
+}
+
+pub fn set_audio_default(selector: &str) -> Result<(), String> {
+    with_monitorctl_lock(|| audio::set_default(selector))
+}
+
+pub fn set_audio_suppression(enabled: bool) -> Result<(), String> {
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        config.audio.suppress_nvidia = enabled;
         save_config(&config)
     })
 }
@@ -611,6 +674,8 @@ pub struct Config {
     pub hotkeys: BTreeMap<String, HotkeyAction>,
     #[serde(default)]
     pub osd: OsdConfig,
+    #[serde(default, skip_serializing_if = "audio::AudioConfig::is_default")]
+    pub audio: audio::AudioConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_active: Option<Vec<DisplayIdentity>>,
 }
@@ -1445,6 +1510,18 @@ mod tests {
         let config = Config::from_toml("[displays]\ndesk = \"old-path\"").unwrap();
         assert_eq!(config.displays["desk"].device_path, "old-path");
         assert_eq!(config.displays["desk"].serial, None);
+        assert_eq!(config.audio, audio::AudioConfig::default());
+    }
+
+    #[test]
+    fn preserves_audio_config_only_when_configured() {
+        let mut config = Config::default();
+        assert!(!config.to_toml().unwrap().contains("[audio]"));
+
+        config.audio.suppress_nvidia = true;
+        config.audio.order = vec!["endpoint-id".into()];
+        let loaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(loaded.audio, config.audio);
     }
 
     #[test]

@@ -9,6 +9,11 @@ extend/duplicate mode.
 
 Profiles are named sets of active displays. They do not store display layout.
 
+Audio quick selection and explicitly enabled NVIDIA audio correction are also
+within product scope. Audio behavior must not change display state. Audio
+capture, volume, mute, endpoint enable/disable, per-app routing, and settings
+UI remain out of scope unless requested.
+
 ## Runtime behavior
 
 - CLI commands enumerate current Windows display state, perform one action,

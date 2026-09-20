@@ -40,6 +40,8 @@ const MENU_PROFILE_BASE: u32 = 2_000;
 const MENU_COLOR_BASE: u32 = 2_500;
 const MENU_RESTORE: u32 = 3_000;
 const MENU_QUIT: u32 = 3_001;
+const MENU_AUDIO_BASE: u32 = 3_500;
+const MENU_AUDIO_SUPPRESS: u32 = 3_499;
 const HOTKEY_BASE: i32 = 4_000;
 const MOD_NOREPEAT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x4000);
 const TRAY_ICON: &[u8] = include_bytes!("../assets/monitorctl.ico");
@@ -51,6 +53,7 @@ static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 struct TrayState {
     hotkeys: BTreeMap<i32, HotkeyAction>,
     menu_actions: BTreeMap<u32, MenuAction>,
+    audio_watcher: Option<monitorctl_core::audio::AudioWatcher>,
 }
 
 #[derive(Clone)]
@@ -69,6 +72,11 @@ enum MenuAction {
         path: String,
         label: String,
     },
+    Audio {
+        id: String,
+        name: String,
+    },
+    ToggleAudioSuppression(bool),
     Restore,
 }
 
@@ -77,6 +85,9 @@ fn tray_state() -> &'static Mutex<TrayState> {
 }
 
 fn main() -> WindowsResult<()> {
+    let _tray_lock = monitorctl_core::acquire_tray_instance().map_err(|error| {
+        windows::core::Error::new(windows::core::HRESULT(0x8000_4005_u32 as i32), error)
+    })?;
     unsafe {
         let taskbar_created = wide("TaskbarCreated");
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(PCWSTR(taskbar_created.as_ptr())));
@@ -106,6 +117,10 @@ fn main() -> WindowsResult<()> {
         })?;
         add_icon(window)?;
         register_hotkeys(window);
+        match monitorctl_core::audio::AudioWatcher::start() {
+            Ok(watcher) => tray_state().lock().unwrap().audio_watcher = Some(watcher),
+            Err(error) => show_osd(&error, 5_000),
+        }
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
@@ -151,6 +166,9 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             delete_icon(window);
             unregister_hotkeys(window);
+            if let Some(watcher) = tray_state().lock().unwrap().audio_watcher.take() {
+                watcher.shutdown();
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -159,8 +177,11 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn show_menu(window: HWND) {
+    for status in monitorctl_core::audio::take_watcher_status() {
+        show_osd(&status, 5_000);
+    }
     let Ok(state) = menu_state() else {
-        show_osd("Cannot read monitor state", 5_000);
+        show_osd("Cannot read tray configuration", 5_000);
         return;
     };
     let mut menu_actions = BTreeMap::new();
@@ -189,6 +210,14 @@ unsafe fn show_menu(window: HWND) {
                 label: display.label.clone(),
                 active: display.active,
             },
+        );
+    }
+    if let Some(error) = &state.display_error {
+        append(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            &format!("Unavailable: {error}"),
         );
     }
     append(menu, MF_SEPARATOR, 0, "");
@@ -276,6 +305,59 @@ unsafe fn show_menu(window: HWND) {
         }
     }
     append(menu, MF_SEPARATOR, 0, "");
+    append(menu, MF_STRING | MF_DISABLED, 0, "Audio Device");
+    append(
+        menu,
+        MF_STRING
+            | if state.suppress_nvidia {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+        MENU_AUDIO_SUPPRESS,
+        "Suppress Nvidia audio",
+    );
+    menu_actions.insert(
+        MENU_AUDIO_SUPPRESS,
+        MenuAction::ToggleAudioSuppression(state.suppress_nvidia),
+    );
+    append(menu, MF_STRING | MF_DISABLED, 0, "Devices:");
+    for (index, endpoint) in state.audio.iter().enumerate() {
+        let id = MENU_AUDIO_BASE + index as u32;
+        append(
+            menu,
+            MF_STRING
+                | if state
+                    .multimedia_default
+                    .as_deref()
+                    .is_some_and(|current| current == endpoint.id)
+                {
+                    MF_CHECKED
+                } else {
+                    MENU_ITEM_FLAGS(0)
+                },
+            id,
+            &format!("    - {}", endpoint.name),
+        );
+        menu_actions.insert(
+            id,
+            MenuAction::Audio {
+                id: endpoint.id.clone(),
+                name: endpoint.name.clone(),
+            },
+        );
+    }
+    if let Some(error) = &state.audio_error {
+        append(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            &format!("Unavailable: {error}"),
+        );
+    } else if state.audio.is_empty() {
+        append(menu, MF_STRING | MF_GRAYED, 0, "No active outputs");
+    }
+    append(menu, MF_SEPARATOR, 0, "");
     append(
         menu,
         if state.restore_available {
@@ -358,6 +440,25 @@ unsafe fn run_menu_action(window: HWND, command: u32) {
             monitorctl_core::color::use_system_settings_for_path(&path),
             format!("Using system color settings for {label}"),
         ),
+        Some(MenuAction::Audio { id, name }) => (
+            monitorctl_core::set_audio_default(&id),
+            format!("Selected audio output {name}"),
+        ),
+        Some(MenuAction::ToggleAudioSuppression(current)) => {
+            let result = monitorctl_core::set_audio_suppression(!current);
+            if result.is_ok() {
+                if let Some(watcher) = tray_state().lock().unwrap().audio_watcher.as_ref() {
+                    watcher.wake();
+                }
+            }
+            (
+                result,
+                format!(
+                    "NVIDIA audio suppression {}",
+                    if current { "disabled" } else { "enabled" }
+                ),
+            )
+        }
         None => return,
     };
     show_result(result, &success);
@@ -529,8 +630,13 @@ fn parse_hotkey(value: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 
 struct MenuState {
     displays: Vec<MenuDisplay>,
+    display_error: Option<String>,
     profiles: Vec<MenuProfile>,
     colors: Vec<MenuColor>,
+    audio: Vec<monitorctl_core::audio::Endpoint>,
+    audio_error: Option<String>,
+    multimedia_default: Option<String>,
+    suppress_nvidia: bool,
     active_count: usize,
     restore_available: bool,
 }
@@ -562,93 +668,116 @@ struct MenuColor {
 
 fn menu_state() -> std::result::Result<MenuState, String> {
     let config = load_config()?;
-    let discovered = discover_displays()?;
-    let active = active_paths(&discovered);
-    let mut displays = discovered
-        .iter()
-        .map(|display| {
-            let alias = alias_for_display(&config, &discovered, display);
-            MenuDisplay {
-                label: display_label(alias, &display.friendly_name),
-                path: Some(display.device_path.clone()),
-                active: display.active,
-            }
-        })
-        .collect::<Vec<_>>();
-    displays.extend(
-        config
-            .displays
-            .iter()
-            .filter(|(_, identity)| resolve_identity(&discovered, identity).is_err())
-            .map(|(alias, _)| MenuDisplay {
-                label: format!("{alias}  Unavailable"),
-                path: None,
-                active: false,
-            }),
-    );
-    let profiles = config
-        .profiles
-        .iter()
-        .map(|(name, identities)| {
-            let displays = identities
-                .iter()
-                .map(|identity| {
-                    let label = resolve_identity(&discovered, identity)
-                        .map(|display| {
-                            display_label(
-                                alias_for_display(&config, &discovered, display),
-                                &display.friendly_name,
-                            )
+    let (displays, display_error, profiles, colors, active_count, restore_available) =
+        match discover_displays() {
+            Ok(discovered) => {
+                let active = active_paths(&discovered);
+                let mut displays = discovered
+                    .iter()
+                    .map(|display| {
+                        let alias = alias_for_display(&config, &discovered, display);
+                        MenuDisplay {
+                            label: display_label(alias, &display.friendly_name),
+                            path: Some(display.device_path.clone()),
+                            active: display.active,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                displays.extend(
+                    config
+                        .displays
+                        .iter()
+                        .filter(|(_, identity)| resolve_identity(&discovered, identity).is_err())
+                        .map(|(alias, _)| MenuDisplay {
+                            label: format!("{alias}  Unavailable"),
+                            path: None,
+                            active: false,
+                        }),
+                );
+                let profiles = config
+                    .profiles
+                    .iter()
+                    .map(|(name, identities)| {
+                        let displays = identities
+                            .iter()
+                            .map(|identity| {
+                                let label = resolve_identity(&discovered, identity)
+                                    .map(|display| {
+                                        display_label(
+                                            alias_for_display(&config, &discovered, display),
+                                            &display.friendly_name,
+                                        )
+                                    })
+                                    .unwrap_or_else(|_| {
+                                        identity
+                                            .friendly_name
+                                            .clone()
+                                            .unwrap_or_else(|| "Unavailable display".into())
+                                    });
+                                MenuProfileDisplay { label }
+                            })
+                            .collect();
+                        let resolved = resolve_identities(&discovered, identities);
+                        MenuProfile {
+                            name: name.clone(),
+                            displays,
+                            available: !identities.is_empty() && resolved.is_ok(),
+                            active: resolved.is_ok_and(|paths| paths == active),
+                        }
+                    })
+                    .collect();
+                let colors = discovered
+                    .iter()
+                    .filter(|display| display.active)
+                    .filter_map(|display| {
+                        let alias = alias_for_display(&config, &discovered, display);
+                        let label = display_label(alias, &display.friendly_name);
+                        let profiles =
+                            monitorctl_core::color::safe_profiles_for_path(&display.device_path)
+                                .unwrap_or_default();
+                        (!profiles.is_empty()).then(|| MenuColor {
+                            label,
+                            path: display.device_path.clone(),
+                            uses_current_user_settings:
+                                monitorctl_core::color::uses_current_user_settings_for_path(
+                                    &display.device_path,
+                                )
+                                .unwrap_or(false),
+                            current: monitorctl_core::color::current_for_path(&display.device_path)
+                                .ok()
+                                .flatten(),
+                            profiles,
                         })
-                        .unwrap_or_else(|_| {
-                            identity
-                                .friendly_name
-                                .clone()
-                                .unwrap_or_else(|| "Unavailable display".into())
-                        });
-                    MenuProfileDisplay { label }
-                })
-                .collect();
-            let resolved = resolve_identities(&discovered, identities);
-            MenuProfile {
-                name: name.clone(),
-                displays,
-                available: !identities.is_empty() && resolved.is_ok(),
-                active: resolved.is_ok_and(|paths| paths == active),
+                    })
+                    .collect();
+                let restore_available = config.previous_active.as_ref().is_some_and(|identities| {
+                    !identities.is_empty() && resolve_identities(&discovered, identities).is_ok()
+                });
+                (
+                    displays,
+                    None,
+                    profiles,
+                    colors,
+                    active.len(),
+                    restore_available,
+                )
             }
-        })
-        .collect();
-    let colors = discovered
-        .iter()
-        .filter(|display| display.active)
-        .filter_map(|display| {
-            let alias = alias_for_display(&config, &discovered, display);
-            let label = display_label(alias, &display.friendly_name);
-            let profiles = monitorctl_core::color::safe_profiles_for_path(&display.device_path)
-                .unwrap_or_default();
-            (!profiles.is_empty()).then(|| MenuColor {
-                label,
-                path: display.device_path.clone(),
-                uses_current_user_settings:
-                    monitorctl_core::color::uses_current_user_settings_for_path(
-                        &display.device_path,
-                    )
-                    .unwrap_or(false),
-                current: monitorctl_core::color::current_for_path(&display.device_path)
-                    .ok()
-                    .flatten(),
-                profiles,
-            })
-        })
-        .collect();
-    let restore_available = config.previous_active.as_ref().is_some_and(|identities| {
-        !identities.is_empty() && resolve_identities(&discovered, identities).is_ok()
-    });
+            Err(error) => (Vec::new(), Some(error), Vec::new(), Vec::new(), 0, false),
+        };
+    let (audio, multimedia_default, audio_error) = match monitorctl_core::audio::tray_snapshot() {
+        Ok((audio, multimedia_default)) => (audio, multimedia_default, None),
+        Err(error) => (Vec::new(), None, Some(error)),
+    };
     Ok(MenuState {
         displays,
+        display_error,
         profiles,
         colors,
-        active_count: active.len(),
+        audio,
+        audio_error,
+        multimedia_default,
+        suppress_nvidia: config.audio.suppress_nvidia,
+        active_count,
         restore_available,
     })
 }
