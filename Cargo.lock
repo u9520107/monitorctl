@@ -92,6 +92,7 @@ dependencies = [
  "sha2",
  "toml",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

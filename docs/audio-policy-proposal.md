@@ -1,8 +1,8 @@
 # Audio policy proposal
 
-Status: revised design and implementation handoff; implementation not started
+Status: revised design; Phase 4 implementation complete, Phase 5 validation pending
 Created: 2026-08-27
-Updated: 2026-09-13
+Updated: 2026-09-20
 Reviewed repository: branch `audio-policy-implementation`, commit `2c89510`
 
 ## Executive summary
@@ -267,7 +267,7 @@ compilation alone. Do not start automatic correction before the setter gate pass
 [x] Phase 1: explicit default setter
 [x] Phase 2: tray quick selection
 [x] Phase 3: live list and suppression decision tests
-[ ] Phase 4: tray observation and automatic correction
+[x] Phase 4: tray observation and automatic correction
 [ ] Phase 5: Windows/NVIDIA validation
 ```
 
@@ -410,6 +410,18 @@ uncommitted unless the user explicitly authorizes a commit in that turn.
   `cargo fmt --check`, `cargo check`, `cargo test`, and `git diff --check` pass.
   Phase 3 exit gate passed. Next action: Phase 4 tray observation and bounded
   automatic correction.
+- 2026-09-20: Phase 4 adds a single tray-owned Core Audio notification worker.
+  Callbacks enqueue signals only; the worker performs startup reconciliation,
+  200 ms event coalescing, bounded three-attempt correction retries, and clean
+  callback unregister on shutdown. Order writes reload config under the shared
+  operation mutex. Automatic correction rechecks suppression, endpoint state,
+  classification, and managed Console/Multimedia defaults before setting only
+  roles currently on NVIDIA, then verifies affected roles. The tray exposes a
+  persisted `Suppress NVIDIA audio` checkbox, wakes the worker immediately when
+  toggled, rejects explicit NVIDIA selection while enabled, and uses a named
+  tray mutex to prevent duplicate watcher owners. `cargo fmt --check`, `cargo
+  check`, `cargo test`, and `git diff --check` pass. Real Windows/NVIDIA
+  validation remains Phase 5 and is pending.
 
 ## Sources
 

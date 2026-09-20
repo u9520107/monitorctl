@@ -195,6 +195,9 @@ Manage those entries with `monitorctl hotkey list`, `monitorctl hotkey set`, and
 The `Audio output` section lists active render outputs and marks the current
 Multimedia output. Selecting an entry uses the same validated Console and
 Multimedia setter as `audio set-default`; it performs no automatic selection.
+`Suppress NVIDIA audio` enables the tray watcher. While enabled, NVIDIA
+defaults are corrected to the first active known non-NVIDIA output in the live
+observed order. Disable it to leave Windows audio selection untouched.
 
 Tray results use a native lower-center OSD. Configure opacity from `0.10` to
 `1.00`, or preview it from CLI:

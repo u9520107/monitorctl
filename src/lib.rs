@@ -1,3 +1,5 @@
+extern crate windows_core;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -11,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, WAIT_ABANDONED,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+            GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
         System::{
@@ -38,6 +40,7 @@ pub mod osd;
 
 const MONITORCTL_MUTEX_NAME: &str = "Local\\monitorctl-operation";
 const MONITORCTL_MUTEX_WAIT_MS: u32 = 10_000;
+const MONITORCTL_TRAY_MUTEX_NAME: &str = "Local\\monitorctl-tray";
 static CONFIG_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct MonitorctlLock(HANDLE);
@@ -78,6 +81,28 @@ impl Drop for MonitorctlLock {
 fn with_monitorctl_lock<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let _lock = MonitorctlLock::acquire()?;
     action()
+}
+
+pub struct TrayInstanceLock(HANDLE);
+
+pub fn acquire_tray_instance() -> Result<TrayInstanceLock, String> {
+    let name = MONITORCTL_TRAY_MUTEX_NAME
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        .map_err(|error| format!("cannot create tray instance lock: {error}"))?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle) }.ok();
+        return Err("monitorctl-tray is already running".into());
+    }
+    Ok(TrayInstanceLock(handle))
+}
+
+impl Drop for TrayInstanceLock {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) }.ok();
+    }
 }
 
 pub fn run_cli() -> Result<(), String> {
@@ -292,6 +317,14 @@ fn set_osd_opacity(value: &str) -> Result<(), String> {
 
 pub fn set_audio_default(selector: &str) -> Result<(), String> {
     with_monitorctl_lock(|| audio::set_default(selector))
+}
+
+pub fn set_audio_suppression(enabled: bool) -> Result<(), String> {
+    with_monitorctl_lock(|| {
+        let mut config = load_config()?;
+        config.audio.suppress_nvidia = enabled;
+        save_config(&config)
+    })
 }
 
 fn list() -> Result<(), String> {

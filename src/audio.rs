@@ -1,4 +1,9 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::{Mutex, OnceLock, mpsc},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +16,8 @@ use windows::{
         Foundation::{ERROR_NOT_FOUND, PROPERTYKEY},
         Media::Audio::{
             DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT,
-            DEVICE_STATE_UNPLUGGED, DEVICE_STATEMASK_ALL, IMMDevice, IMMDeviceEnumerator,
+            DEVICE_STATE_UNPLUGGED, DEVICE_STATEMASK_ALL, EDataFlow, ERole, IMMDevice,
+            IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
             MMDeviceEnumerator, eCommunications, eConsole, eMultimedia, eRender,
         },
         System::Com::{
@@ -61,6 +67,67 @@ pub struct AudioReconciliation {
     pub order: Vec<String>,
     pub decision: AudioDecision,
     pub enumeration_failed: bool,
+}
+
+enum WatcherSignal {
+    Event,
+    Stop,
+}
+
+pub struct AudioWatcher {
+    sender: mpsc::Sender<WatcherSignal>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AudioWatcher {
+    pub fn start() -> Result<Self, String> {
+        let (sender, receiver) = mpsc::channel();
+        let worker_sender = sender.clone();
+        let join = thread::Builder::new()
+            .name("monitorctl-audio".into())
+            .spawn(move || watcher_worker(receiver, worker_sender))
+            .map_err(|error| format!("cannot start audio watcher: {error}"))?;
+        Ok(Self {
+            sender,
+            join: Some(join),
+        })
+    }
+
+    pub fn wake(&self) {
+        let _ = self.sender.send(WatcherSignal::Event);
+    }
+
+    pub fn shutdown(mut self) {
+        let _ = self.sender.send(WatcherSignal::Stop);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for AudioWatcher {
+    fn drop(&mut self) {
+        let _ = self.sender.send(WatcherSignal::Stop);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+static WATCHER_STATUS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+pub fn take_watcher_status() -> Vec<String> {
+    WATCHER_STATUS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map(|mut status| std::mem::take(&mut *status))
+        .unwrap_or_default()
+}
+
+fn report_watcher_status(message: impl Into<String>) {
+    if let Ok(mut status) = WATCHER_STATUS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        status.push(message.into());
+    }
 }
 
 impl fmt::Display for NvidiaClassification {
@@ -178,6 +245,13 @@ pub fn default() -> Result<(), String> {
 pub fn set_default(selector: &str) -> Result<(), String> {
     let endpoints = snapshot(false)?;
     let endpoint = resolve_endpoint(&endpoints, selector)?;
+    if super::load_config()?.audio.suppress_nvidia
+        && endpoint.classification == NvidiaClassification::Nvidia
+    {
+        return Err(
+            "NVIDIA audio selection is disabled while NVIDIA suppression is enabled".into(),
+        );
+    }
     let endpoint_name = endpoint.name.clone();
     let endpoint_id = endpoint.id.clone();
 
@@ -344,6 +418,10 @@ fn resolve_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Result<&'a
 }
 
 fn set_default_roles(endpoint_id: &str) -> Result<(), String> {
+    set_default_roles_for(endpoint_id, &["Console", "Multimedia"])
+}
+
+fn set_default_roles_for(endpoint_id: &str, roles: &[&str]) -> Result<(), String> {
     let _com = ComApartment::initialize()?;
     let policy: IPolicyConfig =
         unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL) }
@@ -353,7 +431,11 @@ fn set_default_roles(endpoint_id: &str) -> Result<(), String> {
         .chain(Some(0))
         .collect::<Vec<_>>();
     let mut failures = Vec::new();
-    for (role_name, role) in [("Console", eConsole), ("Multimedia", eMultimedia)] {
+    for (role_name, role) in roles.iter().filter_map(|name| match *name {
+        "Console" => Some(("Console", eConsole)),
+        "Multimedia" => Some(("Multimedia", eMultimedia)),
+        _ => None,
+    }) {
         if let Err(error) =
             unsafe { policy.set_default_endpoint(PCWSTR(endpoint_id.as_ptr()), role) }
         {
@@ -367,6 +449,209 @@ fn set_default_roles(endpoint_id: &str) -> Result<(), String> {
     } else {
         Err(failures.join("; "))
     }
+}
+
+#[windows::core::implement(IMMNotificationClient)]
+struct AudioNotificationClient {
+    sender: mpsc::Sender<WatcherSignal>,
+}
+
+impl IMMNotificationClient_Impl for AudioNotificationClient_Impl {
+    fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> windows::core::Result<()> {
+        let _ = self.sender.send(WatcherSignal::Event);
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _: &PCWSTR) -> windows::core::Result<()> {
+        let _ = self.sender.send(WatcherSignal::Event);
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _: &PCWSTR) -> windows::core::Result<()> {
+        let _ = self.sender.send(WatcherSignal::Event);
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(
+        &self,
+        _: EDataFlow,
+        _: ERole,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        let _ = self.sender.send(WatcherSignal::Event);
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> windows::core::Result<()> {
+        let _ = self.sender.send(WatcherSignal::Event);
+        Ok(())
+    }
+}
+
+fn watcher_worker(receiver: mpsc::Receiver<WatcherSignal>, sender: mpsc::Sender<WatcherSignal>) {
+    let Ok(_com) = ComApartment::initialize() else {
+        report_watcher_status("Audio watcher unavailable: cannot initialize Core Audio COM");
+        return;
+    };
+    let Ok(enumerator) = create_enumerator() else {
+        report_watcher_status("Audio watcher unavailable: cannot create Core Audio enumerator");
+        return;
+    };
+    let callback = AudioNotificationClient { sender };
+    let callback: IMMNotificationClient = callback.into();
+    if let Err(error) = unsafe { enumerator.RegisterEndpointNotificationCallback(&callback) } {
+        report_watcher_status(format!("Audio watcher unavailable: {error}"));
+        return;
+    }
+
+    process_burst(&receiver);
+    while let Ok(signal) = receiver.recv() {
+        if matches!(signal, WatcherSignal::Stop) {
+            break;
+        }
+        if process_burst(&receiver) {
+            break;
+        }
+    }
+    let _ = unsafe { enumerator.UnregisterEndpointNotificationCallback(&callback) };
+}
+
+fn process_burst(receiver: &mpsc::Receiver<WatcherSignal>) -> bool {
+    let mut attempts = 0;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(WatcherSignal::Stop) => return true,
+            Ok(WatcherSignal::Event) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+        }
+
+        match observe_and_correct() {
+            Ok(()) => return false,
+            Err(error) => {
+                report_watcher_status(error);
+                if attempts == 3 {
+                    return false;
+                }
+                attempts += 1;
+                match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(WatcherSignal::Stop) => return true,
+                    Ok(WatcherSignal::Event) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+                }
+            }
+        }
+    }
+}
+
+fn observe_and_correct() -> Result<(), String> {
+    let config = super::load_config()?;
+    let endpoints = snapshot(false)?;
+    let current_defaults = defaults()?;
+    let current_multimedia = default_id(&current_defaults, "Multimedia");
+    let reconciliation = reconcile(
+        &config.audio.order,
+        Ok(&endpoints),
+        current_multimedia.as_deref(),
+        config.audio.suppress_nvidia,
+    );
+    persist_order(&reconciliation.order)?;
+
+    if !config.audio.suppress_nvidia {
+        return Ok(());
+    }
+
+    if nvidia_roles(&endpoints, &current_defaults).is_empty() {
+        return Ok(());
+    }
+    let Some(target) = reconciliation.order.iter().find(|id| {
+        endpoints
+            .iter()
+            .find(|endpoint| &endpoint.id == *id)
+            .is_some_and(|endpoint| endpoint.classification == NvidiaClassification::NonNvidia)
+    }) else {
+        report_watcher_status(
+            "NVIDIA default detected, but no eligible non-NVIDIA fallback exists",
+        );
+        return Ok(());
+    };
+
+    if apply_correction(target)? {
+        let endpoints = snapshot(false)?;
+        let current_defaults = defaults()?;
+        let config = super::load_config()?;
+        let order = reconcile(
+            &config.audio.order,
+            Ok(&endpoints),
+            default_id(&current_defaults, "Multimedia").as_deref(),
+            config.audio.suppress_nvidia,
+        )
+        .order;
+        persist_order(&order)?;
+    }
+    Ok(())
+}
+
+fn apply_correction(target: &str) -> Result<bool, String> {
+    super::with_monitorctl_lock(|| {
+        let config = super::load_config()?;
+        if !config.audio.suppress_nvidia {
+            return Ok(false);
+        }
+        let endpoints = snapshot(false)?;
+        let target_endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == target)
+            .filter(|endpoint| endpoint.classification == NvidiaClassification::NonNvidia)
+            .ok_or_else(|| "audio fallback disappeared before correction".to_string())?;
+        let current_defaults = defaults()?;
+        let roles = nvidia_roles(&endpoints, &current_defaults);
+        if roles.is_empty() {
+            return Ok(false);
+        }
+        set_default_roles_for(&target_endpoint.id, &roles)?;
+        let verified = defaults()?;
+        for role in &roles {
+            if default_id(&verified, role).as_deref() != Some(target_endpoint.id.as_str()) {
+                return Err(format!(
+                    "automatic audio correction failed verification for {role}"
+                ));
+            }
+        }
+        Ok(true)
+    })
+}
+
+fn default_id(defaults: &[(&'static str, Option<String>)], role: &str) -> Option<String> {
+    defaults
+        .iter()
+        .find(|(name, _)| *name == role)
+        .and_then(|(_, id)| id.clone())
+}
+
+fn nvidia_roles(
+    endpoints: &[Endpoint],
+    defaults: &[(&'static str, Option<String>)],
+) -> Vec<&'static str> {
+    ["Console", "Multimedia"]
+        .into_iter()
+        .filter(|role| {
+            default_id(defaults, role)
+                .and_then(|id| endpoints.iter().find(|endpoint| endpoint.id == id))
+                .is_some_and(|endpoint| endpoint.classification == NvidiaClassification::Nvidia)
+        })
+        .collect()
+}
+
+fn persist_order(order: &[String]) -> Result<(), String> {
+    super::with_monitorctl_lock(|| {
+        let mut config = super::load_config()?;
+        if config.audio.order == order {
+            return Ok(());
+        }
+        config.audio.order = order.to_vec();
+        super::save_config(&config)
+    })
 }
 
 #[repr(transparent)]
@@ -581,7 +866,7 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
 mod tests {
     use super::{
         AudioDecision, Endpoint, EndpointState, NvidiaClassification, classify,
-        is_no_default_error, reconcile, resolve_endpoint,
+        is_no_default_error, nvidia_roles, reconcile, resolve_endpoint,
     };
     use windows::core::{Error, HRESULT};
 
@@ -762,6 +1047,20 @@ mod tests {
             .decision,
             AudioDecision::Noop
         );
+    }
+
+    #[test]
+    fn correction_targets_only_current_nvidia_managed_roles() {
+        let endpoints = [
+            classified_endpoint("nvidia", "Monitor", NvidiaClassification::Nvidia),
+            classified_endpoint("dac", "DAC", NvidiaClassification::NonNvidia),
+        ];
+        let defaults = [
+            ("Console", Some("nvidia".into())),
+            ("Multimedia", Some("dac".into())),
+        ];
+        assert_eq!(nvidia_roles(&endpoints, &defaults), ["Console"]);
+        assert!(nvidia_roles(&endpoints, &[("Console", None), ("Multimedia", None)]).is_empty());
     }
 
     #[test]

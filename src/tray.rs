@@ -41,6 +41,7 @@ const MENU_COLOR_BASE: u32 = 2_500;
 const MENU_RESTORE: u32 = 3_000;
 const MENU_QUIT: u32 = 3_001;
 const MENU_AUDIO_BASE: u32 = 3_500;
+const MENU_AUDIO_SUPPRESS: u32 = 3_499;
 const HOTKEY_BASE: i32 = 4_000;
 const MOD_NOREPEAT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x4000);
 const TRAY_ICON: &[u8] = include_bytes!("../assets/monitorctl.ico");
@@ -52,6 +53,7 @@ static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 struct TrayState {
     hotkeys: BTreeMap<i32, HotkeyAction>,
     menu_actions: BTreeMap<u32, MenuAction>,
+    audio_watcher: Option<monitorctl_core::audio::AudioWatcher>,
 }
 
 #[derive(Clone)]
@@ -74,6 +76,7 @@ enum MenuAction {
         id: String,
         name: String,
     },
+    ToggleAudioSuppression(bool),
     Restore,
 }
 
@@ -82,6 +85,9 @@ fn tray_state() -> &'static Mutex<TrayState> {
 }
 
 fn main() -> WindowsResult<()> {
+    let _tray_lock = monitorctl_core::acquire_tray_instance().map_err(|error| {
+        windows::core::Error::new(windows::core::HRESULT(0x8000_4005_u32 as i32), error)
+    })?;
     unsafe {
         let taskbar_created = wide("TaskbarCreated");
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(PCWSTR(taskbar_created.as_ptr())));
@@ -111,6 +117,10 @@ fn main() -> WindowsResult<()> {
         })?;
         add_icon(window)?;
         register_hotkeys(window);
+        match monitorctl_core::audio::AudioWatcher::start() {
+            Ok(watcher) => tray_state().lock().unwrap().audio_watcher = Some(watcher),
+            Err(error) => show_osd(&error, 5_000),
+        }
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
@@ -156,6 +166,9 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             delete_icon(window);
             unregister_hotkeys(window);
+            if let Some(watcher) = tray_state().lock().unwrap().audio_watcher.take() {
+                watcher.shutdown();
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -164,6 +177,9 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn show_menu(window: HWND) {
+    for status in monitorctl_core::audio::take_watcher_status() {
+        show_osd(&status, 5_000);
+    }
     let Ok(state) = menu_state() else {
         show_osd("Cannot read tray configuration", 5_000);
         return;
@@ -290,6 +306,21 @@ unsafe fn show_menu(window: HWND) {
     }
     append(menu, MF_SEPARATOR, 0, "");
     append(menu, MF_STRING | MF_DISABLED, 0, "Audio output");
+    append(
+        menu,
+        MF_STRING
+            | if state.suppress_nvidia {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+        MENU_AUDIO_SUPPRESS,
+        "Suppress NVIDIA audio",
+    );
+    menu_actions.insert(
+        MENU_AUDIO_SUPPRESS,
+        MenuAction::ToggleAudioSuppression(state.suppress_nvidia),
+    );
     for (index, endpoint) in state.audio.iter().enumerate() {
         let id = MENU_AUDIO_BASE + index as u32;
         append(
@@ -412,6 +443,21 @@ unsafe fn run_menu_action(window: HWND, command: u32) {
             monitorctl_core::set_audio_default(&id),
             format!("Selected audio output {name}"),
         ),
+        Some(MenuAction::ToggleAudioSuppression(current)) => {
+            let result = monitorctl_core::set_audio_suppression(!current);
+            if result.is_ok() {
+                if let Some(watcher) = tray_state().lock().unwrap().audio_watcher.as_ref() {
+                    watcher.wake();
+                }
+            }
+            (
+                result,
+                format!(
+                    "NVIDIA audio suppression {}",
+                    if current { "disabled" } else { "enabled" }
+                ),
+            )
+        }
         None => return,
     };
     show_result(result, &success);
@@ -589,6 +635,7 @@ struct MenuState {
     audio: Vec<monitorctl_core::audio::Endpoint>,
     audio_error: Option<String>,
     multimedia_default: Option<String>,
+    suppress_nvidia: bool,
     active_count: usize,
     restore_available: bool,
 }
@@ -728,6 +775,7 @@ fn menu_state() -> std::result::Result<MenuState, String> {
         audio,
         audio_error,
         multimedia_default,
+        suppress_nvidia: config.audio.suppress_nvidia,
         active_count,
         restore_available,
     })
